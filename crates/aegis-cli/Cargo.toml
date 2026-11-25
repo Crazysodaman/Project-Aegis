@@ -1,0 +1,46 @@
+[package]
+name = "aegis-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Aegis local development CLI"
+
+[[bin]]
+name = "aegis"
+path = "src/main.rs"
+
+[dependencies]
+aegis-backup.workspace = true
+aegis-cognition.workspace = true
+aegis-contracts.workspace = true
+aegis-conversation.workspace = true
+aegis-core-install.workspace = true
+aegis-core-profiles.workspace = true
+aegis-core-runtime.workspace = true
+aegis-core-sdk.workspace = true
+aegis-diagnostics.workspace = true
+aegis-embodiment.workspace = true
+aegis-fleet.workspace = true
+aegis-embeddings.workspace = true
+aegis-host.workspace = true
+aegis-installer.workspace = true
+aegis-modules.workspace = true
+aegis-safe.workspace = true
+aegis-ipc.workspace = true
+aegis-platform.workspace = true
+aegis-roster.workspace = true
+aegis-service.workspace = true
+aegis-social.workspace = true
+aegis-storage.workspace = true
+aegis-tools.workspace = true
+aegis-ui.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

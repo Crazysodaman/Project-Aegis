@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/core/v1/core-registry.schema.json",
+  "title": "Aegis Core registry entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "core_uuid",
+    "core_number",
+    "display_name",
+    "lifecycle_state",
+    "storage_relative_path",
+    "initialized_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema": { "const": "aegis.core.registry.v1" },
+    "core_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "core_number": { "type": "integer", "enum": [1, 2, 3, 6, 7] },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "lifecycle_state": {
+      "type": "string",
+      "enum": ["design_only", "approved", "installed", "active", "suspended", "retired"]
+    },
+    "storage_relative_path": {
+      "type": "string",
+      "pattern": "^cores/[0-9a-f-]{36}/core\\.db$"
+    },
+    "initialized_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  }
+}

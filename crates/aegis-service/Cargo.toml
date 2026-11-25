@@ -1,0 +1,26 @@
+[package]
+name = "aegis-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Aegis Platform background service lifecycle supervisor"
+
+[dependencies]
+aegis-contracts.workspace = true
+aegis-ipc.workspace = true
+aegis-platform.workspace = true
+aegis-safe.workspace = true
+aegis-storage.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

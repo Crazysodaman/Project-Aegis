@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/core/v1/integrity-manifest.schema.json",
+  "title": "Aegis Core integrity manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "core_uuid",
+    "database_file",
+    "database_sha256",
+    "database_bytes",
+    "schema_revision",
+    "identity_sha256",
+    "algorithm",
+    "created_at"
+  ],
+  "properties": {
+    "schema": { "const": "aegis.core.integrity_manifest.v1" },
+    "core_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "database_file": { "const": "core.db" },
+    "database_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "database_bytes": { "type": "integer", "minimum": 1 },
+    "schema_revision": { "type": "integer", "minimum": 1 },
+    "identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "algorithm": { "const": "sha256" },
+    "created_at": { "type": "string", "minLength": 1 }
+  }
+}

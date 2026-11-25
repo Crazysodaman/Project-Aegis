@@ -1,0 +1,27 @@
+﻿[package]
+name = "aegis-safe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Aegis Safe boundary: owner proof, STOP, approvals, and security audit"
+
+[dependencies]
+aegis-contracts.workspace = true
+aegis-storage.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

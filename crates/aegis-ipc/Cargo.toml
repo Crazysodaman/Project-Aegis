@@ -1,0 +1,22 @@
+﻿[package]
+name = "aegis-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Versioned local JSON-RPC transport for Aegis Platform"
+
+[dependencies]
+aegis-contracts.workspace = true
+aegis-platform.workspace = true
+interprocess.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

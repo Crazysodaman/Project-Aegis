@@ -1,0 +1,30 @@
+[package]
+name = "aegis-conversation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Per-Core conversation persistence and provider-independent interaction engine"
+
+[dependencies]
+aegis-cognition.workspace = true
+aegis-contracts.workspace = true
+aegis-core-sdk.workspace = true
+aegis-core-storage.workspace = true
+aegis-embeddings.workspace = true
+aegis-storage.workspace = true
+aegis-tools.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+aegis-core-install.workspace = true
+aegis-platform.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/core/v1/initialization-request.schema.json",
+  "title": "Aegis Core initialization request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "core_uuid", "core_number", "display_name", "requested_at"],
+  "properties": {
+    "schema": { "const": "aegis.core.initialization.v1" },
+    "core_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "core_number": { "type": "integer", "enum": [1, 2, 3, 6, 7] },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "requested_at": { "type": "string", "minLength": 1 }
+  }
+}

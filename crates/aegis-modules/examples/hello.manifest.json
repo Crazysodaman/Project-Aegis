@@ -1,0 +1,70 @@
+{
+  "schema": "aegis.module.manifest.v1",
+  "module_id": "com.example.hello",
+  "name": "Hello Module",
+  "version": "0.1.0",
+  "publisher": "Example Publisher",
+  "sdk": {
+    "sdk": "aegis.module.sdk",
+    "min_version": "1.0.0",
+    "max_version": "1.9.9"
+  },
+  "capabilities": [
+    "log.write",
+    "ui.notifications"
+  ],
+  "permissions": [
+    {
+      "name": "log.write",
+      "reason": "Record module lifecycle messages in the module log."
+    },
+    {
+      "name": "ui.notifications",
+      "reason": "Show a startup notification when the module is enabled."
+    }
+  ],
+  "dependencies": [],
+  "entrypoint": {
+    "kind": "wasm",
+    "runtime": "aegis-module-runtime-v1",
+    "path": "bin/hello.wasm",
+    "symbol": "_start",
+    "args": []
+  },
+  "assets": [
+    {
+      "path": "bin/hello.wasm",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "bytes": 4096
+    }
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "lifecycle": [
+    {
+      "name": "on_enable",
+      "entrypoint": "activate"
+    },
+    {
+      "name": "on_disable",
+      "entrypoint": "deactivate"
+    }
+  ],
+  "resources": {
+    "max_memory_bytes": 16777216,
+    "max_cpu_millis": 1000,
+    "max_disk_bytes": 1048576,
+    "max_open_files": 32
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "dec9533b15b7b263d83ab5942aa23e5f0b5adb2458057b25aac5a5c1d5c2508f"
+  }
+}

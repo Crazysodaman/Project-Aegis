@@ -1,0 +1,24 @@
+[package]
+name = "aegis-core-profiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Approved Core identity/personality/appearance profile data and application"
+
+[dependencies]
+aegis-core-sdk.workspace = true
+aegis-roster.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+aegis-contracts.workspace = true
+aegis-core-install.workspace = true
+aegis-platform.workspace = true
+aegis-storage.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

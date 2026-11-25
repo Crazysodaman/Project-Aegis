@@ -1,0 +1,29 @@
+[package]
+name = "aegis-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Aegis local GUI dashboard and terminal UI over real Platform APIs"
+
+[dependencies]
+aegis-contracts.workspace = true
+aegis-core-install.workspace = true
+aegis-core-registry.workspace = true
+aegis-core-runtime.workspace = true
+aegis-diagnostics.workspace = true
+aegis-modules.workspace = true
+aegis-platform.workspace = true
+aegis-safe.workspace = true
+aegis-storage.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+aegis-platform.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

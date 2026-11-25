@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/ipc/v1/stop-mutation.schema.json",
+  "title": "Aegis Safe STOP mutation result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "active", "revision", "updated_at"],
+  "properties": {
+    "schema": { "const": "aegis.safe.stop_mutation.v1" },
+    "active": { "type": "boolean" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "aegis-installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Platform installation, upgrade, and uninstall orchestration"
+
+[dependencies]
+aegis-backup.workspace = true
+aegis-platform.workspace = true
+aegis-safe.workspace = true
+aegis-service.workspace = true
+aegis-storage.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+aegis-contracts.workspace = true
+aegis-core-install.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

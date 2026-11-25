@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/ipc/v1/platform-status.schema.json",
+  "title": "Aegis Platform status v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "protocol",
+    "platform_id",
+    "callsign",
+    "zero_core",
+    "core_count",
+    "stop_active",
+    "authority",
+    "generated_at"
+  ],
+  "properties": {
+    "schema": { "const": "aegis.platform.status.v1" },
+    "protocol": { "const": "1.0" },
+    "platform_id": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "callsign": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "zero_core": { "type": "boolean" },
+    "core_count": { "type": "integer", "minimum": 0 },
+    "stop_active": { "type": "boolean" },
+    "authority": { "const": "local_single" },
+    "generated_at": { "type": "string", "minLength": 1 }
+  }
+}

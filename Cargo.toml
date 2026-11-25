@@ -1,0 +1,83 @@
+[workspace]
+members = [
+    "crates/aegis-contracts",
+    "crates/aegis-storage",
+    "crates/aegis-safe",
+    "crates/aegis-platform",
+    "crates/aegis-ipc",
+    "crates/aegis-cli",
+    "crates/aegis-core-identity",
+    "crates/aegis-core-storage",
+    "crates/aegis-core-integrity",
+    "crates/aegis-core-registry",
+    "crates/aegis-core-install",
+    "crates/aegis-core-runtime",
+    "crates/aegis-modules",
+    "crates/aegis-diagnostics",
+    "crates/aegis-cognition",
+    "crates/aegis-backup",
+    "crates/aegis-core-sdk",
+    "crates/aegis-conversation",
+    "crates/aegis-embodiment",
+    "crates/aegis-tools",
+    "crates/aegis-embeddings",
+    "crates/aegis-social",
+    "crates/aegis-core-profiles",
+    "crates/aegis-fleet",
+    "crates/aegis-roster",
+    "crates/aegis-installer",
+    "crates/aegis-host",
+    "crates/aegis-ui",
+    "crates/aegis-service",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[workspace.dependencies]
+aegis-contracts = { path = "crates/aegis-contracts" }
+aegis-storage = { path = "crates/aegis-storage" }
+aegis-safe = { path = "crates/aegis-safe" }
+aegis-platform = { path = "crates/aegis-platform" }
+aegis-ipc = { path = "crates/aegis-ipc" }
+aegis-core-identity = { path = "crates/aegis-core-identity" }
+aegis-core-storage = { path = "crates/aegis-core-storage" }
+aegis-core-integrity = { path = "crates/aegis-core-integrity" }
+aegis-core-registry = { path = "crates/aegis-core-registry" }
+aegis-core-install = { path = "crates/aegis-core-install" }
+aegis-core-runtime = { path = "crates/aegis-core-runtime" }
+aegis-modules = { path = "crates/aegis-modules" }
+aegis-diagnostics = { path = "crates/aegis-diagnostics" }
+aegis-cognition = { path = "crates/aegis-cognition" }
+aegis-backup = { path = "crates/aegis-backup" }
+aegis-core-sdk = { path = "crates/aegis-core-sdk" }
+aegis-conversation = { path = "crates/aegis-conversation" }
+aegis-embodiment = { path = "crates/aegis-embodiment" }
+aegis-tools = { path = "crates/aegis-tools" }
+aegis-embeddings = { path = "crates/aegis-embeddings" }
+aegis-social = { path = "crates/aegis-social" }
+aegis-core-profiles = { path = "crates/aegis-core-profiles" }
+aegis-fleet = { path = "crates/aegis-fleet" }
+aegis-roster = { path = "crates/aegis-roster" }
+aegis-installer = { path = "crates/aegis-installer" }
+aegis-host = { path = "crates/aegis-host" }
+aegis-ui = { path = "crates/aegis-ui" }
+aegis-service = { path = "crates/aegis-service" }
+chrono = { version = "=0.4.40", default-features = false, features = ["clock", "std"] }
+getrandom = "=0.2.17"
+interprocess = "=2.2.3"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.140"
+sha2 = "=0.10.8"
+thiserror = "=2.0.12"
+uuid = { version = "=1.26.1", features = ["v4"] }
+tempfile = "=3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

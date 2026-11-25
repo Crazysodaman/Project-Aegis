@@ -1,0 +1,33 @@
+[package]
+name = "aegis-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Owner-authorized tool registry and execution bridge for Aegis Cores"
+
+[[bin]]
+name = "aegis-tools-test-module"
+path = "src/bin/aegis-tools-test-module.rs"
+
+[dependencies]
+aegis-contracts.workspace = true
+aegis-core-install.workspace = true
+aegis-core-sdk.workspace = true
+aegis-core-storage.workspace = true
+aegis-modules.workspace = true
+aegis-platform.workspace = true
+aegis-safe.workspace = true
+aegis-storage.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

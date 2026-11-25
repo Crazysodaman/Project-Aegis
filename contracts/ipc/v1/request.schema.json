@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/ipc/v1/request.schema.json",
+  "title": "Aegis IPC request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol", "request_id", "method", "params", "client", "auth"],
+  "properties": {
+    "schema": { "const": "aegis.ipc.request.v1" },
+    "protocol": { "const": "1.0" },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:/\\-]+$"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "platform.status",
+        "platform.effect.ping",
+        "safe.stop.status",
+        "safe.stop.set",
+        "safe.stop.clear"
+      ]
+    },
+    "params": { "type": "object" },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_token"],
+      "properties": {
+        "owner_token": { "type": "string", "minLength": 1, "maxLength": 8192 }
+      }
+    }
+  }
+}

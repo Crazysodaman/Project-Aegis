@@ -1,0 +1,19 @@
+﻿[package]
+name = "aegis-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Low-level Aegis storage paths and SQLite guards"
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

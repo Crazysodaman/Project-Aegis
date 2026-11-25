@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.local/contracts/core/v1/core-identity.schema.json",
+  "title": "Aegis Core identity v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "core_uuid",
+    "core_number",
+    "display_name",
+    "created_at",
+    "identity_revision"
+  ],
+  "properties": {
+    "schema": { "const": "aegis.core.identity.v1" },
+    "core_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "core_number": { "type": "integer", "enum": [1, 2, 3, 6, 7] },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "identity_revision": { "type": "integer", "minimum": 1 }
+  }
+}
