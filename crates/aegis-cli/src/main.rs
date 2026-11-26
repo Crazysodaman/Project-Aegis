@@ -32,7 +32,7 @@ use aegis_ipc::{
 };
 use aegis_modules::{ModuleManager, ModuleRuntime, ModuleRuntimeStatus};
 use aegis_platform::{
-    OpenMeteoProvider, PlatformService, UnavailableWeatherProvider, WorldService,
+    CatalogStore, OpenMeteoProvider, PlatformService, UnavailableWeatherProvider, WorldService,
 };
 use aegis_roster::{resolve_display_name, validate_roster, ApprovedCoreDesign};
 use aegis_service::ServiceManager;
@@ -85,6 +85,7 @@ fn run() -> Result<(), String> {
         Some("fleet") => command_fleet(&args),
         Some("world") => command_world(&args),
         Some("personal") => command_personal(&args),
+        Some("living") => command_living(&args),
         Some("voice") => command_voice(&args),
         Some("effect") => command_effect(&args),
         Some("ipc") => command_ipc(&args),
@@ -1137,6 +1138,194 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
         },
         other => Err(format!("unknown fleet command: {other}")),
     }
+}
+
+fn command_living(args: &[String]) -> Result<(), String> {
+    let root = require_arg(args, "--root")?;
+    let group = args.get(1).map(String::as_str).unwrap_or("item");
+    if group == "catalog" {
+        let text = args
+            .get(2)
+            .ok_or_else(|| "missing positional catalog search text".to_owned())?;
+        let paths = StoragePaths::new(PathBuf::from(root)).map_err(|error| error.to_string())?;
+        let catalog = CatalogStore::new(paths);
+        catalog.initialize().map_err(|error| error.to_string())?;
+        let results = catalog.search(text).map_err(|error| error.to_string())?;
+        return print_json(&json!({
+            "schema": "aegis.cli.catalog_search.v1",
+            "results": results,
+        }));
+    }
+
+    require_owner_proof(root)?;
+    let core = require_arg(args, "--core")?;
+    let action = args.get(2).map(String::as_str).unwrap_or("list");
+    let id = living_positional_id(args);
+    let limit = parse_usize(args, "--limit", 50)?;
+    let optional = |name: &str| {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .unwrap_or(Value::Null)
+    };
+    let required = |name: &str| -> Result<Value, String> {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .ok_or_else(|| format!("missing required argument {name}"))
+    };
+
+    let (tool, arguments) = match (group, action) {
+        ("item", "list") => ("item.list", json!({"limit": limit})),
+        ("item", "create") => (
+            "item.create",
+            json!({
+                "name": required("--name")?,
+                "category": optional("--category"),
+                "description": optional("--description"),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        ("item", "show") => (
+            "item.get",
+            json!({"instance_id": id.ok_or_else(|| "missing item id".to_owned())?}),
+        ),
+        ("item", "modify") => (
+            "item.modify",
+            json!({
+                "instance_id": id.ok_or_else(|| "missing item id".to_owned())?,
+                "name": optional("--name"),
+                "description": optional("--description"),
+                "state": optional("--state"),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        ("item", "archive") => (
+            "item.archive",
+            json!({"instance_id": id.ok_or_else(|| "missing item id".to_owned())?}),
+        ),
+        ("outfit", "list") => ("outfit.list", json!({"limit": limit})),
+        ("outfit", "create") => {
+            let items = parse_tags(optional_arg(args, "--items"));
+            if items.is_empty() {
+                return Err("missing --items (comma-separated item instance IDs)".to_owned());
+            }
+            (
+                "outfit.create",
+                json!({
+                    "name": required("--name")?,
+                    "item_instance_ids": items,
+                    "visibility": optional("--visibility"),
+                }),
+            )
+        }
+        ("outfit", "rename") => (
+            "outfit.rename",
+            json!({
+                "outfit_id": id.ok_or_else(|| "missing outfit id".to_owned())?,
+                "name": required("--name")?,
+            }),
+        ),
+        ("document", "list") => (
+            "document.list",
+            json!({"limit": limit, "query": optional("--query")}),
+        ),
+        ("document", "create") => (
+            "document.create",
+            json!({
+                "title": required("--title")?,
+                "body": optional("--body"),
+                "format": optional("--format"),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        ("document", "read") => (
+            "document.read",
+            json!({"document_id": id.ok_or_else(|| "missing document id".to_owned())?}),
+        ),
+        ("document", "write") => (
+            "document.write",
+            json!({
+                "document_id": id.ok_or_else(|| "missing document id".to_owned())?,
+                "title": optional("--title"),
+                "body": optional("--body"),
+                "format": optional("--format"),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        ("object", "list") => ("object.list", json!({"limit": limit})),
+        ("object", "create") => (
+            "object.create",
+            json!({
+                "location": required("--location")?,
+                "state": optional("--state"),
+                "affordances": parse_tags(optional_arg(args, "--affordances")),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        ("object", "show") => (
+            "object.get",
+            json!({"object_id": id.ok_or_else(|| "missing object id".to_owned())?}),
+        ),
+        ("object", "update") => (
+            "object.update",
+            json!({
+                "object_id": id.ok_or_else(|| "missing object id".to_owned())?,
+                "location": optional("--location"),
+                "state": optional("--state"),
+                "affordances": parse_tags(optional_arg(args, "--affordances")),
+                "visibility": optional("--visibility"),
+            }),
+        ),
+        _ => return Err(format!("unknown living command: {group} {action}")),
+    };
+
+    let executor =
+        ToolExecutor::new(PathBuf::from(root), core).map_err(|error| error.to_string())?;
+    let result = executor
+        .execute(tool, &arguments, None)
+        .map_err(|error| error.to_string())?;
+    print_json(&json!({
+        "schema": "aegis.cli.living.v1",
+        "tool": tool,
+        "status": result.status.as_str(),
+        "output": result.output,
+        "detail": result.detail,
+    }))
+}
+
+/// First non-flag positional after `living <group> <action>`, skipping values
+/// of known value-taking flags, so `--root`/`--core` may appear before an ID.
+fn living_positional_id(args: &[String]) -> Option<String> {
+    const VALUE_FLAGS: [&str; 15] = [
+        "--root",
+        "--core",
+        "--limit",
+        "--name",
+        "--category",
+        "--description",
+        "--visibility",
+        "--state",
+        "--location",
+        "--affordances",
+        "--items",
+        "--title",
+        "--body",
+        "--format",
+        "--query",
+    ];
+    let mut index = 3;
+    while index < args.len() {
+        let token = args[index].as_str();
+        if VALUE_FLAGS.contains(&token) {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("--") {
+            index += 1;
+            continue;
+        }
+        return Some(token.to_owned());
+    }
+    None
 }
 
 fn command_personal(args: &[String]) -> Result<(), String> {
@@ -2229,6 +2418,8 @@ fn usage() {
          aegis world set-timezone --root <path> --timezone <iana>\n\
          aegis world set-location --root <path> --lat <degrees> --lon <degrees>\n\
          aegis personal show --root <path> --core <core-id>\n\
+         aegis living item|outfit|document|object list|create|show|modify|archive|rename|read|write|update --root <path> --core <id> [options]\n\
+         aegis living catalog search <text> --root <path>\n\
          aegis voice synthesize --root <path> --core <core-id> --text <text> --out <wav> [--rate <percent>] [--volume <percent>]\n\
          aegis asset import <core-id> <kind> <file> --root <path> [--name <name>] [--media-type <type>] [--tags a,b]\n\
          aegis asset list <core-id> --root <path> [--kind <kind>] [--include-deleted]\n\

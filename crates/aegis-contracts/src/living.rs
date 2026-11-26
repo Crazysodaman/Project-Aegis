@@ -483,6 +483,50 @@ impl Goal {
     }
 }
 
+impl ItemCategory {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "garment" => Self::Garment,
+            "footwear" => Self::Footwear,
+            "accessory" => Self::Accessory,
+            "armor" => Self::Armor,
+            "jewelry" => Self::Jewelry,
+            "container" => Self::Container,
+            "book" => Self::Book,
+            "document" => Self::Document,
+            "artwork" => Self::Artwork,
+            "decoration" => Self::Decoration,
+            "tool" => Self::Tool,
+            "other" => Self::Other,
+            _ => return None,
+        })
+    }
+}
+
+impl Visibility {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "private" => Self::Private,
+            "shared" => Self::Shared,
+            "owner_only" => Self::OwnerOnly,
+            "public_catalog" => Self::PublicCatalog,
+            _ => return None,
+        })
+    }
+}
+
+impl DocumentFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "plain_text" => Self::PlainText,
+            "markdown" => Self::Markdown,
+            "note" => Self::Note,
+            "letter" => Self::Letter,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

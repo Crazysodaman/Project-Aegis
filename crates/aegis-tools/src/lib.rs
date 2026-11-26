@@ -11,13 +11,17 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aegis_contracts::living::{DocumentFormat, ItemCategory, Visibility};
 use aegis_core_install::CoreInstaller;
+use aegis_core_sdk::possessions::{
+    InstanceUpdate, NewInstance, NewObject, NewOutfit, ObjectUpdate, PossessionsStore,
+};
 use aegis_core_sdk::{CoreMemoryStore, MemoryKind, MemoryQuery, NewMemory};
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_modules::{
     run_module_tool, ModuleManager, ModuleRegistry, ModuleToolBinding, MAX_TOOL_INPUT_BYTES,
 };
-use aegis_platform::PlatformService;
+use aegis_platform::{CatalogStore, PlatformService};
 use aegis_safe::{SafeError, SafeStore};
 use aegis_storage::{
     now_rfc3339, open_initialized, StorageError, StoragePaths, PLATFORM_APPLICATION_ID,
@@ -38,6 +42,9 @@ const TOOL_COMPONENT: &str = "tools";
 #[serde(rename_all = "snake_case")]
 pub enum ToolSensitivity {
     ReadOnly,
+    /// Personal creation owned by the calling Core. Permitted without owner
+    /// approval but still audited and STOP-gated. Never touches another Core.
+    PersonalWrite,
     Sensitive,
 }
 
@@ -45,6 +52,7 @@ impl ToolSensitivity {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
+            Self::PersonalWrite => "personal_write",
             Self::Sensitive => "sensitive",
         }
     }
@@ -62,7 +70,7 @@ pub struct ToolSpec {
 }
 
 /// Every tool this bridge can execute.
-pub const TOOL_SPECS: [ToolSpec; 6] = [
+pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "memory.search",
         description: "Search this Core's private memories.",
@@ -110,6 +118,150 @@ pub const TOOL_SPECS: [ToolSpec; 6] = [
         sensitivity: ToolSensitivity::ReadOnly,
         approval_required: false,
         input: "{}",
+    },
+    ToolSpec {
+        name: "item.create",
+        description: "Create a new personally-owned item (garment, book, object, etc.).",
+        permission: "inventory.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ name: string, category: string, description?: string, visibility?: string }",
+    },
+    ToolSpec {
+        name: "item.get",
+        description: "Inspect one item owned or held by this Core.",
+        permission: "inventory.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ instance_id: string }",
+    },
+    ToolSpec {
+        name: "item.list",
+        description: "List this Core's inventory.",
+        permission: "inventory.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "item.modify",
+        description: "Modify an item owned by this Core.",
+        permission: "inventory.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ instance_id: string, name?: string, description?: string, category?: string, visibility?: string, state?: string, condition_percent?: number, location?: string }",
+    },
+    ToolSpec {
+        name: "item.archive",
+        description: "Archive an item owned by this Core (state=archived).",
+        permission: "inventory.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ instance_id: string }",
+    },
+    ToolSpec {
+        name: "catalog.search",
+        description: "Search the shared item catalog.",
+        permission: "catalog.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ text: string, limit?: number }",
+    },
+    ToolSpec {
+        name: "catalog.add_to_inventory",
+        description: "Add a shared catalog definition to this Core's inventory.",
+        permission: "inventory.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ definition_id: string }",
+    },
+    ToolSpec {
+        name: "outfit.create",
+        description: "Save a personal outfit from owned/held item instances.",
+        permission: "wardrobe.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ name: string, item_instance_ids: string[], visibility?: string }",
+    },
+    ToolSpec {
+        name: "outfit.list",
+        description: "List this Core's saved outfits.",
+        permission: "wardrobe.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "outfit.rename",
+        description: "Rename one of this Core's saved outfits.",
+        permission: "wardrobe.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ outfit_id: string, name: string }",
+    },
+    ToolSpec {
+        name: "document.create",
+        description: "Create a personal document, journal, notebook or letter.",
+        permission: "documents.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ title: string, body?: string, format?: string, visibility?: string }",
+    },
+    ToolSpec {
+        name: "document.write",
+        description: "Revise an existing personal document.",
+        permission: "documents.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ document_id: string, title?: string, body?: string, format?: string, visibility?: string }",
+    },
+    ToolSpec {
+        name: "document.read",
+        description: "Read one personal document.",
+        permission: "documents.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ document_id: string }",
+    },
+    ToolSpec {
+        name: "document.list",
+        description: "List/search personal documents (metadata only).",
+        permission: "documents.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number, query?: string }",
+    },
+    ToolSpec {
+        name: "object.create",
+        description: "Create a persistent personal world object.",
+        permission: "objects.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ location: string, state?: string, affordances?: string[], visibility?: string }",
+    },
+    ToolSpec {
+        name: "object.get",
+        description: "Inspect one personal object.",
+        permission: "objects.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ object_id: string }",
+    },
+    ToolSpec {
+        name: "object.update",
+        description: "Update a personal object's state, location or affordances.",
+        permission: "objects.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ object_id: string, location?: string, state?: string, affordances?: string[], visibility?: string }",
+    },
+    ToolSpec {
+        name: "object.list",
+        description: "List personal world objects.",
+        permission: "objects.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
     },
 ];
 
@@ -213,6 +365,10 @@ pub enum ToolError {
     Safe(#[from] SafeError),
     #[error("Core SDK failed: {0}")]
     Sdk(#[from] aegis_core_sdk::SdkError),
+    #[error("catalog operation failed: {0}")]
+    Catalog(#[from] aegis_platform::CatalogError),
+    #[error("record was not found")]
+    NotFound,
     #[error("Core storage failed: {0}")]
     CoreStorage(#[from] aegis_core_storage::CoreStorageError),
     #[error("Core installation failed: {0}")]
@@ -637,6 +793,24 @@ impl ToolExecutor {
                 }))
             }
             "time.now" => Ok(json!({"now": now_rfc3339()?})),
+            "item.create" => self.item_create(arguments),
+            "item.get" => self.item_get(arguments),
+            "item.list" => self.item_list(arguments),
+            "item.modify" => self.item_modify(arguments),
+            "item.archive" => self.item_archive(arguments),
+            "catalog.search" => self.catalog_search(arguments),
+            "catalog.add_to_inventory" => self.catalog_add_to_inventory(arguments),
+            "outfit.create" => self.outfit_create(arguments),
+            "outfit.list" => self.outfit_list(arguments),
+            "outfit.rename" => self.outfit_rename(arguments),
+            "document.create" => self.document_create(arguments),
+            "document.write" => self.document_write(arguments),
+            "document.read" => self.document_read(arguments),
+            "document.list" => self.document_list(arguments),
+            "object.create" => self.object_create(arguments),
+            "object.get" => self.object_get(arguments),
+            "object.update" => self.object_update(arguments),
+            "object.list" => self.object_list(arguments),
             _ => Err(ToolError::InvalidInput("unknown tool")),
         }
     }
@@ -695,6 +869,338 @@ impl ToolExecutor {
         let store = CoreMemoryStore::open(self.paths.root(), &self.caller_core)?;
         let entry = store.create(memory)?;
         Ok(serde_json::to_value(entry)?)
+    }
+
+    fn possessions(&self) -> Result<PossessionsStore, ToolError> {
+        Ok(PossessionsStore::open(
+            self.paths.root(),
+            &self.caller_core,
+        )?)
+    }
+
+    fn item_create(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let name = optional_str(arguments, "name", 160)?.ok_or(ToolError::InvalidInput("name"))?;
+        let category = match optional_str(arguments, "category", 64)? {
+            Some(value) => {
+                ItemCategory::parse(&value).ok_or(ToolError::InvalidInput("category"))?
+            }
+            None => ItemCategory::Other,
+        };
+        let mut new = NewInstance::new(name, category);
+        if let Some(description) = optional_text(arguments, "description", 4096)? {
+            new.description = description;
+        }
+        new.visibility = parse_visibility(arguments)?;
+        let item = self.possessions()?.create_instance(&new)?;
+        Ok(serde_json::to_value(item)?)
+    }
+
+    fn item_get(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let instance_id = optional_str(arguments, "instance_id", 128)?
+            .ok_or(ToolError::InvalidInput("instance_id"))?;
+        let item = self
+            .possessions()?
+            .get_instance(&instance_id)?
+            .ok_or(ToolError::NotFound)?;
+        Ok(serde_json::to_value(item)?)
+    }
+
+    fn item_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let items = self.possessions()?.list_inventory(limit as usize)?;
+        Ok(serde_json::to_value(items)?)
+    }
+
+    fn item_modify(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let instance_id = optional_str(arguments, "instance_id", 128)?
+            .ok_or(ToolError::InvalidInput("instance_id"))?;
+        let store = self.possessions()?;
+        let current = store
+            .get_instance(&instance_id)?
+            .ok_or(ToolError::NotFound)?;
+        let category = match optional_str(arguments, "category", 64)? {
+            Some(value) => {
+                ItemCategory::parse(&value).ok_or(ToolError::InvalidInput("category"))?
+            }
+            None => current.category,
+        };
+        let visibility = match optional_str(arguments, "visibility", 32)? {
+            Some(value) => {
+                Visibility::parse(&value).ok_or(ToolError::InvalidInput("visibility"))?
+            }
+            None => current.visibility(),
+        };
+        let update = InstanceUpdate {
+            name: optional_str(arguments, "name", 160)?.unwrap_or_else(|| current.name.clone()),
+            description: optional_text(arguments, "description", 4096)?
+                .unwrap_or_else(|| current.description.clone()),
+            category,
+            visibility,
+            properties: arguments
+                .get("properties")
+                .cloned()
+                .unwrap_or_else(|| current.properties.clone()),
+            condition_percent: optional_u64(arguments, "condition_percent")?
+                .map(|value| value.min(100) as u8)
+                .unwrap_or(current.instance.condition_percent),
+            location: optional_str(arguments, "location", 160)?
+                .or_else(|| current.instance.location.clone()),
+        };
+        let updated = store.update_instance(&instance_id, &update)?;
+        if let Some(state) = optional_str(arguments, "state", 64)? {
+            store.set_state(&instance_id, &state)?;
+        }
+        Ok(serde_json::to_value(updated)?)
+    }
+
+    fn item_archive(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let instance_id = optional_str(arguments, "instance_id", 128)?
+            .ok_or(ToolError::InvalidInput("instance_id"))?;
+        let item = self.possessions()?.set_state(&instance_id, "archived")?;
+        Ok(serde_json::to_value(item)?)
+    }
+
+    fn catalog_search(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let text = optional_str(arguments, "text", 256)?.ok_or(ToolError::InvalidInput("text"))?;
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(20)
+            .clamp(1, 100);
+        let catalog = CatalogStore::new(self.paths.clone());
+        catalog.initialize()?;
+        let mut results = catalog.search(&text)?;
+        results.truncate(limit as usize);
+        Ok(serde_json::to_value(results)?)
+    }
+
+    fn catalog_add_to_inventory(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let definition_id = optional_str(arguments, "definition_id", 128)?
+            .ok_or(ToolError::InvalidInput("definition_id"))?;
+        let catalog = CatalogStore::new(self.paths.clone());
+        catalog.initialize()?;
+        let definition = catalog.get(&definition_id)?.ok_or(ToolError::NotFound)?;
+        let mut new = NewInstance::new(definition.name, definition.category);
+        new.definition_id = Some(definition_id);
+        new.description = definition.description;
+        new.visibility = Visibility::Private;
+        new.properties = definition.properties;
+        let item = self.possessions()?.create_instance(&new)?;
+        Ok(serde_json::to_value(item)?)
+    }
+
+    fn outfit_create(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let name = optional_str(arguments, "name", 160)?.ok_or(ToolError::InvalidInput("name"))?;
+        let ids = optional_string_array(arguments, "item_instance_ids", 64, 128)?;
+        if ids.is_empty() {
+            return Err(ToolError::InvalidInput("item_instance_ids"));
+        }
+        let mut new = NewOutfit::new(name, ids);
+        new.visibility = parse_visibility(arguments)?;
+        let outfit = self.possessions()?.create_outfit(&new)?;
+        Ok(serde_json::to_value(outfit)?)
+    }
+
+    fn outfit_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let outfits = self.possessions()?.list_outfits(limit as usize)?;
+        Ok(serde_json::to_value(outfits)?)
+    }
+
+    fn outfit_rename(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let outfit_id = optional_str(arguments, "outfit_id", 128)?
+            .ok_or(ToolError::InvalidInput("outfit_id"))?;
+        let name = optional_str(arguments, "name", 160)?.ok_or(ToolError::InvalidInput("name"))?;
+        let store = self.possessions()?;
+        let current = store
+            .list_outfits(500)?
+            .into_iter()
+            .find(|outfit| outfit.outfit_id == outfit_id)
+            .ok_or(ToolError::NotFound)?;
+        let outfit = store.update_outfit(
+            &outfit_id,
+            &name,
+            &current.item_instance_ids,
+            current.visibility,
+        )?;
+        Ok(serde_json::to_value(outfit)?)
+    }
+
+    fn document_create(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let title =
+            optional_str(arguments, "title", 160)?.ok_or(ToolError::InvalidInput("title"))?;
+        let body = optional_text(arguments, "body", 1_048_576)?.unwrap_or_default();
+        let format = match optional_str(arguments, "format", 32)? {
+            Some(value) => {
+                DocumentFormat::parse(&value).ok_or(ToolError::InvalidInput("format"))?
+            }
+            None => DocumentFormat::PlainText,
+        };
+        let document = self.possessions()?.create_document(
+            &title,
+            &body,
+            format,
+            parse_visibility(arguments)?,
+        )?;
+        Ok(serde_json::to_value(document)?)
+    }
+
+    fn document_write(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let document_id = optional_str(arguments, "document_id", 128)?
+            .ok_or(ToolError::InvalidInput("document_id"))?;
+        let store = self.possessions()?;
+        let current = store
+            .get_document(&document_id)?
+            .ok_or(ToolError::NotFound)?;
+        let title = optional_str(arguments, "title", 160)?.unwrap_or(current.title);
+        let body = optional_text(arguments, "body", 1_048_576)?.unwrap_or(current.body);
+        let format = match optional_str(arguments, "format", 32)? {
+            Some(value) => {
+                DocumentFormat::parse(&value).ok_or(ToolError::InvalidInput("format"))?
+            }
+            None => current.format,
+        };
+        let visibility = match optional_str(arguments, "visibility", 32)? {
+            Some(value) => {
+                Visibility::parse(&value).ok_or(ToolError::InvalidInput("visibility"))?
+            }
+            None => current.visibility,
+        };
+        let document = store.update_document(&document_id, &title, &body, format, visibility)?;
+        Ok(serde_json::to_value(document)?)
+    }
+
+    fn document_read(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let document_id = optional_str(arguments, "document_id", 128)?
+            .ok_or(ToolError::InvalidInput("document_id"))?;
+        let document = self
+            .possessions()?
+            .get_document(&document_id)?
+            .ok_or(ToolError::NotFound)?;
+        Ok(serde_json::to_value(document)?)
+    }
+
+    fn document_list(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let query = optional_str(arguments, "query", 256)?.map(|q| q.to_lowercase());
+        let documents = self.possessions()?.list_documents(limit as usize)?;
+        let output: Vec<Value> = documents
+            .into_iter()
+            .filter(|document| {
+                query.as_ref().is_none_or(|q| {
+                    document.title.to_lowercase().contains(q)
+                        || document.body.to_lowercase().contains(q)
+                })
+            })
+            .map(|document| {
+                json!({
+                    "document_id": document.document_id,
+                    "title": document.title,
+                    "format": document.format,
+                    "visibility": document.visibility,
+                    "created_at": document.created_at,
+                    "updated_at": document.updated_at,
+                    "revision": document.revision,
+                })
+            })
+            .collect();
+        Ok(Value::Array(output))
+    }
+
+    fn object_create(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let location =
+            optional_str(arguments, "location", 160)?.ok_or(ToolError::InvalidInput("location"))?;
+        let mut new = NewObject::new(location);
+        if let Some(state) = optional_str(arguments, "state", 64)? {
+            new.state = state;
+        }
+        new.affordances = optional_string_array(arguments, "affordances", 32, 64)?;
+        new.visibility = parse_visibility(arguments)?;
+        let object = self.possessions()?.create_object(&new)?;
+        Ok(serde_json::to_value(object)?)
+    }
+
+    fn object_get(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let object_id = optional_str(arguments, "object_id", 128)?
+            .ok_or(ToolError::InvalidInput("object_id"))?;
+        let object = self
+            .possessions()?
+            .list_objects(500)?
+            .into_iter()
+            .find(|object| object.object_id == object_id)
+            .ok_or(ToolError::NotFound)?;
+        Ok(serde_json::to_value(object)?)
+    }
+
+    fn object_update(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let object_id = optional_str(arguments, "object_id", 128)?
+            .ok_or(ToolError::InvalidInput("object_id"))?;
+        let store = self.possessions()?;
+        let current = store
+            .list_objects(500)?
+            .into_iter()
+            .find(|object| object.object_id == object_id)
+            .ok_or(ToolError::NotFound)?;
+        let visibility = match optional_str(arguments, "visibility", 32)? {
+            Some(value) => {
+                Visibility::parse(&value).ok_or(ToolError::InvalidInput("visibility"))?
+            }
+            None => current.visibility,
+        };
+        let update = ObjectUpdate {
+            location: optional_str(arguments, "location", 160)?.unwrap_or(current.location),
+            state: optional_str(arguments, "state", 64)?.unwrap_or(current.state),
+            affordances: if arguments.contains_key("affordances") {
+                optional_string_array(arguments, "affordances", 32, 64)?
+            } else {
+                current.affordances
+            },
+            visibility,
+        };
+        let object = store.update_object(&object_id, &update)?;
+        Ok(serde_json::to_value(object)?)
+    }
+
+    fn object_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let objects = self.possessions()?.list_objects(limit as usize)?;
+        Ok(serde_json::to_value(objects)?)
     }
 
     fn result(
@@ -812,6 +1318,34 @@ fn optional_str(
             Ok(Some(value.clone()))
         }
         Some(_) => Err(ToolError::InvalidInput(key)),
+    }
+}
+
+fn optional_text(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+    maximum: usize,
+) -> Result<Option<String>, ToolError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            if value.chars().count() > maximum
+                || value
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+            {
+                return Err(ToolError::InvalidInput(key));
+            }
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(ToolError::InvalidInput(key)),
+    }
+}
+
+fn parse_visibility(arguments: &serde_json::Map<String, Value>) -> Result<Visibility, ToolError> {
+    match optional_str(arguments, "visibility", 32)? {
+        Some(value) => Visibility::parse(&value).ok_or(ToolError::InvalidInput("visibility")),
+        None => Ok(Visibility::Private),
     }
 }
 
