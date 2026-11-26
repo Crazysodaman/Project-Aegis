@@ -21,6 +21,7 @@ const STANDARD_SIDECARS: &[(&str, &str)] = &[
     ("assets.db", "asset_ownership"),
     ("social.db", "relationship_ownership"),
     ("embeddings.db", "embedding_ownership"),
+    ("possessions.db", "possessions_ownership"),
 ];
 
 fn init_platform() -> (tempfile::TempDir, String) {
@@ -255,9 +256,9 @@ fn full_inventory_backup_and_restore_is_isolated() {
         .find(|core| core.core_uuid == CORE_B)
         .expect("Core B metadata");
 
-    // Core A has core.db plus six sidecars; Core B lacks personal.db.
-    assert_eq!(core_a.databases.len(), 7);
-    assert_eq!(core_b.databases.len(), 6);
+    // Core A has core.db plus seven sidecars; Core B lacks personal.db.
+    assert_eq!(core_a.databases.len(), 8);
+    assert_eq!(core_b.databases.len(), 7);
     assert!(core_a
         .databases
         .iter()
@@ -395,7 +396,7 @@ fn missing_optional_databases_are_reported_not_fatal() {
             .iter()
             .any(|db| db.file_name == CORE_DATABASE_FILE));
         assert_eq!(core.databases.len(), 1);
-        assert_eq!(core.missing_optional_databases.len(), 6);
+        assert_eq!(core.missing_optional_databases.len(), 7);
     }
 
     let (_target_parent, target) = target_path();

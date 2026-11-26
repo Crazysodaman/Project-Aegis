@@ -353,7 +353,7 @@ fn install_validated(
         display_name: manifest.display_name.clone(),
         requested_at: now_rfc3339().map_err(InstallError::Paths)?,
     };
-    Ok(installer.initialize(&request, owner_token)?)
+    Ok(installer.initialize_approved(&request, owner_token)?)
 }
 
 fn validate_package_dir(directory: &Path) -> Result<ValidatedCorePackage, PackageError> {

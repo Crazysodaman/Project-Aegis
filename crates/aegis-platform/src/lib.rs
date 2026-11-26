@@ -1,10 +1,15 @@
 //! Core-neutral Aegis Platform foundation for Batch 1.
 
+mod catalog;
 mod service;
 mod store;
 mod weather;
 mod world;
 
+pub use catalog::{
+    CatalogActor, CatalogError, CatalogFilter, CatalogStore, CATALOG_DEFAULT_LIMIT,
+    CATALOG_MAX_LIMIT, CATALOG_MAX_SEARCH_CHARS,
+};
 pub use service::{InitializationResult, PlatformService, ServiceError};
 pub use store::{PlatformIdentity, PlatformStore};
 pub use weather::{

@@ -13,6 +13,7 @@ aegis-core-identity.workspace = true
 aegis-core-integrity.workspace = true
 aegis-core-registry.workspace = true
 aegis-core-storage.workspace = true
+aegis-roster.workspace = true
 aegis-safe.workspace = true
 aegis-storage.workspace = true
 thiserror.workspace = true

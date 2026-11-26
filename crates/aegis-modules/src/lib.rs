@@ -35,6 +35,7 @@
 //! Windows. None of this is a security sandbox. See
 //! `docs/implementation/BATCH7_AGENT09_SOCIAL_MODULES.md`.
 
+pub mod catalog;
 pub mod manager;
 pub mod manifest;
 pub mod policy;
@@ -43,6 +44,11 @@ pub mod runtime;
 pub mod sandbox;
 pub mod tool_runner;
 
+pub use catalog::{
+    catalog, count, counts, find, len, validate, CatalogCounts, CatalogError,
+    ModuleCatalogCategory, ModuleCatalogEntry, ModuleCatalogStatus, ADAPTER_COUNT, COMPANION_COUNT,
+    EXTERNAL_PARENTS, OPTIONAL_COUNT, SUBMODULE_COUNT, TOTAL_ENTRIES,
+};
 pub use manager::ModuleManager;
 pub use manifest::{
     is_reserved_module_id, is_sha256, validate_module_id, version_satisfies, ManifestError,

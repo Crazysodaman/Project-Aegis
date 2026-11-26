@@ -42,6 +42,8 @@ pub enum InstallError {
     Integrity(#[from] IntegrityError),
     #[error("Core registry failed: {0}")]
     Registry(#[from] RegistryError),
+    #[error("Core roster identity rejected: {0}")]
+    Roster(#[from] aegis_roster::RosterError),
     #[error("storage paths failed: {0}")]
     Paths(#[from] StorageError),
     #[error("Safe authorization failed: {0}")]
@@ -74,6 +76,7 @@ impl InstallError {
                 InitializationFailureCode::IntegrityFailure
             }
             Self::Registry(_) => InitializationFailureCode::RegistrationFailure,
+            Self::Roster(_) => InitializationFailureCode::InvalidIdentity,
             Self::AlreadyInitialized => InitializationFailureCode::AlreadyExists,
             Self::Interrupted => InitializationFailureCode::Interrupted,
         }
@@ -126,6 +129,30 @@ impl CoreInstaller {
         &self.layout
     }
 
+    /// Approved roster install path.
+    ///
+    /// Enforces the canonical Core identity (Sofía's UUID, prohibited twins,
+    /// blank #7 name) before delegating to the low-level primitive. User-facing
+    /// installs (`aegis core install --roster`, `.corepkg`) MUST use this path.
+    pub fn initialize_approved(
+        &self,
+        request: &CoreInitializationRequest,
+        owner_token: &str,
+    ) -> Result<CoreInstallation, InstallError> {
+        self.authorize_owner(owner_token)?;
+        let identity = validate_initialization_request(request)?;
+        aegis_roster::validate_core_identity(
+            identity.core_number,
+            &identity.core_uuid,
+            Some(&identity.display_name),
+        )?;
+        self.initialize(request, owner_token)
+    }
+
+    /// Low-level initialization primitive (syntax/authorization only).
+    ///
+    /// Does not enforce the approved roster identity; use
+    /// [`CoreInstaller::initialize_approved`] for user-facing installs.
     pub fn initialize(
         &self,
         request: &CoreInitializationRequest,

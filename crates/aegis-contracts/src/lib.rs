@@ -6,6 +6,7 @@ pub mod initialization;
 pub mod integrity;
 pub mod ipc;
 pub mod lifecycle;
+pub mod living;
 pub mod personal;
 pub mod roster;
 pub mod status;

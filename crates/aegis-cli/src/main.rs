@@ -291,7 +291,7 @@ fn command_core(args: &[String]) -> Result<(), String> {
                 requested_at: now_rfc3339().map_err(|error| error.to_string())?,
             };
             let installation = installer
-                .initialize(&request, &token)
+                .initialize_approved(&request, &token)
                 .map_err(|error| error.to_string())?;
             print_json(&installation_payload(&installation))
         }

@@ -6,8 +6,8 @@ use aegis_core_install::{CoreInstaller, InstallError};
 use aegis_platform::PlatformService;
 use aegis_storage::now_rfc3339;
 
-const SOFIA: &str = "11111111-1111-4111-8111-111111111111";
-const MACK: &str = "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d";
+const SOFIA: &str = "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d";
+const MACK: &str = "12345678-1234-4234-8234-123456789abc";
 const VERA: &str = "b1b1b1b1-2222-4333-8444-555566667777";
 const TWIN_FOUR: &str = "c2c2c2c2-3333-4444-8555-666677778888";
 const TWIN_FIVE: &str = "d3d3d3d3-4444-4555-8666-777788889999";

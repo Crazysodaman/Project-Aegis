@@ -13,6 +13,7 @@ pub mod events;
 pub mod memory;
 pub mod personal;
 pub mod personality;
+pub mod possessions;
 
 pub use capability::{
     CapabilityManifest, CoreCapability, ALL_CAPABILITIES, CAPABILITY_MANIFEST_SCHEMA,
@@ -46,6 +47,17 @@ pub use personal::{
 pub use personality::{
     PersonalityProfile, MAX_GROWTH_POLICY_CHARS, MAX_TONE_CHARS, MAX_TRAITS, MAX_TRAIT_NAME_CHARS,
     MAX_VALUES, MAX_VALUE_CHARS, PERSONALITY_SCHEMA,
+};
+pub use possessions::{
+    InstanceUpdate, NewInstance, NewObject, NewOutfit, NewPossessionEvent, ObjectUpdate,
+    PossessionEvent, PossessionItem, PossessionsStore, TransferOffer, DEFAULT_ITEM_STATE,
+    DEFAULT_OBJECT_STATE, DOCUMENTS_TABLE, ITEM_INSTANCES_TABLE, MAX_ACTION_CHARS,
+    MAX_ENTITY_KIND_CHARS, MAX_EVENT_DETAIL_BYTES, MAX_EVENT_LIST, MAX_POSSESSION_LIST,
+    MAX_PROPERTIES_BYTES, OUTFITS_TABLE, POSSESSIONS_APPLICATION_ID, POSSESSIONS_COMPONENT,
+    POSSESSIONS_DB_FILE, POSSESSIONS_OWNERSHIP_TABLE, POSSESSIONS_SCHEMA,
+    POSSESSIONS_SCHEMA_REVISION, POSSESSIONS_SCHEMA_TABLE, POSSESSION_EVENTS_TABLE,
+    POSSESSION_EVENT_SCHEMA, TRANSFER_DELIVERY_PENDING, TRANSFER_OFFER_ACTION,
+    TRANSFER_OFFER_STATUS, WORLD_OBJECTS_TABLE,
 };
 
 use std::path::Path;
@@ -178,6 +190,7 @@ pub struct CoreSdkContext {
     pub capabilities: CapabilityManifest,
     pub memory: CoreMemoryStore,
     pub personal: PersonalStore,
+    pub possessions: PossessionsStore,
     pub personality: Option<PersonalityProfile>,
 }
 
@@ -196,6 +209,7 @@ impl CoreSdkContext {
         }
         let memory = CoreMemoryStore::open(root, &core_uuid)?;
         let personal = PersonalStore::open(root, &core_uuid)?;
+        let possessions = PossessionsStore::open(root, &core_uuid)?;
         let capabilities = CapabilityManifest::full(&core_uuid)?;
         let personality = memory.load_personality()?;
         Ok(Self {
@@ -203,6 +217,7 @@ impl CoreSdkContext {
             capabilities,
             memory,
             personal,
+            possessions,
             personality,
         })
     }
@@ -225,6 +240,11 @@ impl CoreSdkContext {
     /// Borrow the personal-state store bound to the same Core identity.
     pub fn personal(&self) -> Result<&PersonalStore, SdkError> {
         Ok(&self.personal)
+    }
+
+    /// Borrow the possessions store bound to the same Core identity.
+    pub fn possessions(&self) -> Result<&PossessionsStore, SdkError> {
+        Ok(&self.possessions)
     }
 
     /// Borrow the most recently loaded personality profile, if any.
