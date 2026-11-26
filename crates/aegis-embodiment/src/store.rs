@@ -11,8 +11,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::appearance::{validate_animation_name, validate_theme, Appearance, Theme, VoiceProfile};
-use crate::asset::{safe_file_name, validate_new_asset, Asset, AssetKind, NewAsset, ASSET_SCHEMA};
+use crate::asset::{
+    safe_file_name, validate_new_asset, Asset, AssetAudit, AssetAuditEntry, AssetFilter, AssetKind,
+    AssetManifest, AssetManifestEntry, AssetState, AuditOutcome, NewAsset, ASSET_AUDIT_SCHEMA,
+    ASSET_MANIFEST_SCHEMA, ASSET_SCHEMA, MAX_ASSET_SEARCH_LIMIT,
+};
 use crate::error::EmbodimentError;
+use crate::voice::VoiceBinding;
 
 /// File name of the per-Core embodiment database.
 pub const EMBODIMENT_DB_FILE: &str = "assets.db";
@@ -190,6 +195,123 @@ impl EmbodimentStore {
         Ok(assets)
     }
 
+    /// Filtered, bounded, deterministically ordered asset search.
+    ///
+    /// Assets are ordered by `created_at` then `asset_id`. The effective limit
+    /// defaults to and is clamped at [`MAX_ASSET_SEARCH_LIMIT`].
+    pub fn list_filtered(&self, filter: &AssetFilter) -> Result<Vec<Asset>, EmbodimentError> {
+        let limit = filter
+            .limit
+            .unwrap_or(MAX_ASSET_SEARCH_LIMIT)
+            .min(MAX_ASSET_SEARCH_LIMIT);
+        let mut assets = self.list_assets(filter.kind, filter.include_deleted)?;
+        assets.retain(|asset| filter.matches(asset));
+        assets.truncate(limit);
+        Ok(assets)
+    }
+
+    /// Alias for [`EmbodimentStore::list_filtered`].
+    pub fn search(&self, filter: &AssetFilter) -> Result<Vec<Asset>, EmbodimentError> {
+        self.list_filtered(filter)
+    }
+
+    /// Re-hash every live asset and report integrity without mutating anything.
+    ///
+    /// Deleted assets are excluded from the audit; their files are retained for
+    /// owner recovery and reported through [`EmbodimentStore::recovery_manifest`].
+    pub fn audit(&self) -> Result<AssetAudit, EmbodimentError> {
+        let assets = self.list_assets(None, false)?;
+        let mut entries = Vec::with_capacity(assets.len());
+        let mut verified = 0;
+        let mut missing = 0;
+        let mut corrupt = 0;
+        for asset in assets {
+            let outcome = self.audit_asset(&asset);
+            match outcome {
+                AuditOutcome::Verified => verified += 1,
+                AuditOutcome::Missing => missing += 1,
+                AuditOutcome::Corrupt => corrupt += 1,
+            }
+            entries.push(AssetAuditEntry {
+                asset_id: asset.asset_id,
+                kind: asset.kind,
+                name: asset.name,
+                sha256: asset.sha256,
+                bytes: asset.bytes,
+                state: AssetState::Live,
+                relative_path: asset.relative_path,
+                outcome,
+            });
+        }
+        Ok(AssetAudit {
+            schema: ASSET_AUDIT_SCHEMA.to_owned(),
+            core_uuid: self.core_uuid.clone(),
+            audited_at: now_rfc3339()?,
+            entries,
+            verified,
+            missing,
+            corrupt,
+        })
+    }
+
+    /// Alias for [`EmbodimentStore::audit`].
+    pub fn verify_all(&self) -> Result<AssetAudit, EmbodimentError> {
+        self.audit()
+    }
+
+    /// Build a backup/recovery manifest for every asset owned by this Core.
+    ///
+    /// Both live and soft-deleted assets are included so the caller can decide
+    /// what to restore. Paths are relative to this Core's root directory.
+    pub fn recovery_manifest(&self) -> Result<AssetManifest, EmbodimentError> {
+        let assets = self.list_assets(None, true)?;
+        let entries = assets
+            .into_iter()
+            .map(|asset| AssetManifestEntry {
+                asset_id: asset.asset_id,
+                kind: asset.kind,
+                name: asset.name,
+                media_type: asset.media_type,
+                sha256: asset.sha256,
+                bytes: asset.bytes,
+                state: if asset.deleted {
+                    AssetState::Deleted
+                } else {
+                    AssetState::Live
+                },
+                relative_path: asset.relative_path,
+            })
+            .collect();
+        Ok(AssetManifest {
+            schema: ASSET_MANIFEST_SCHEMA.to_owned(),
+            core_uuid: self.core_uuid.clone(),
+            generated_at: now_rfc3339()?,
+            entries,
+        })
+    }
+
+    fn audit_asset(&self, asset: &Asset) -> AuditOutcome {
+        let path = self.core_dir.join(&asset.relative_path);
+        if !path.starts_with(&self.core_dir) {
+            return AuditOutcome::Corrupt;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => return AuditOutcome::Missing,
+        };
+        if is_redirected(&metadata) || !metadata.is_file() {
+            return AuditOutcome::Missing;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return AuditOutcome::Missing,
+        };
+        if bytes.len() as u64 != asset.bytes || sha256_hex(&bytes) != asset.sha256 {
+            return AuditOutcome::Corrupt;
+        }
+        AuditOutcome::Verified
+    }
+
     /// Read asset bytes after verifying path containment and content integrity.
     pub fn read_asset(&self, asset_id: &str) -> Result<Vec<u8>, EmbodimentError> {
         let asset = self.asset(asset_id)?;
@@ -314,6 +436,9 @@ impl EmbodimentStore {
     pub fn set_voice(&self, voice: Option<VoiceProfile>) -> Result<Appearance, EmbodimentError> {
         if let Some(voice) = &voice {
             if let Some(sample) = &voice.sample_asset_id {
+                // `require_kind` is scoped to this Core, so a sample owned by a
+                // different Core is reported as `NotFound` and can never be
+                // bound to this Core's voice profile.
                 self.require_kind(sample, AssetKind::VoiceSample)?;
             }
         }
@@ -321,6 +446,42 @@ impl EmbodimentStore {
             appearance.voice = voice.clone();
             Ok(())
         })
+    }
+
+    /// Validate that the configured voice reference remains bound to this Core.
+    ///
+    /// Returns `Ok(None)` when no voice is configured. When a sample asset is
+    /// referenced, it must exist in this Core, be a live `VoiceSample`, still be
+    /// owned by this Core, and pass SHA-256 integrity verification on read.
+    pub fn validate_voice_binding(&self) -> Result<Option<VoiceBinding>, EmbodimentError> {
+        let appearance = self.appearance()?;
+        let Some(voice) = appearance.voice else {
+            return Ok(None);
+        };
+        let mut sample_sha256 = None;
+        let mut sample_bytes = None;
+        if let Some(sample_id) = &voice.sample_asset_id {
+            let asset = self.require_kind(sample_id, AssetKind::VoiceSample)?;
+            if asset.core_uuid != self.core_uuid {
+                return Err(EmbodimentError::OwnershipMismatch);
+            }
+            self.read_asset(sample_id)?;
+            sample_sha256 = Some(asset.sha256);
+            sample_bytes = Some(asset.bytes);
+        }
+        Ok(Some(VoiceBinding {
+            core_uuid: self.core_uuid.clone(),
+            voice_id: voice.voice_id,
+            display_name: voice.display_name,
+            sample_asset_id: voice.sample_asset_id,
+            sample_sha256,
+            sample_bytes,
+        }))
+    }
+
+    /// Alias for [`EmbodimentStore::validate_voice_binding`].
+    pub fn voice_binding(&self) -> Result<Option<VoiceBinding>, EmbodimentError> {
+        self.validate_voice_binding()
     }
 
     pub fn export(&self) -> Result<AssetExport, EmbodimentError> {

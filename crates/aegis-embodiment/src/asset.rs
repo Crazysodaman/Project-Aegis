@@ -17,6 +17,12 @@ pub const MAX_MEDIA_TYPE_CHARS: usize = 128;
 pub const MAX_ASSET_TAGS: usize = 32;
 /// Maximum metadata size in bytes.
 pub const MAX_ASSET_METADATA_BYTES: usize = 64 * 1024;
+/// Schema identifier for an asset-library audit report.
+pub const ASSET_AUDIT_SCHEMA: &str = "aegis.embodiment.audit.v1";
+/// Schema identifier for a recovery manifest.
+pub const ASSET_MANIFEST_SCHEMA: &str = "aegis.embodiment.manifest.v1";
+/// Maximum number of assets returned by one filtered search.
+pub const MAX_ASSET_SEARCH_LIMIT: usize = 1000;
 
 /// Classification of a stored embodiment asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,4 +176,150 @@ pub fn safe_file_name(name: &str) -> String {
         output.push_str("asset");
     }
     output
+}
+
+/// Lifecycle state reported for an asset in audits and manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetState {
+    Live,
+    Deleted,
+}
+
+impl AssetState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+/// Per-asset result produced by an integrity audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Verified,
+    Missing,
+    Corrupt,
+}
+
+impl AuditOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
+/// Query used to filter and bound asset listings. Filtering is additive: an
+/// empty filter returns every asset in the Core (subject to the result limit).
+#[derive(Debug, Clone, Default)]
+pub struct AssetFilter {
+    /// Restrict to one asset kind.
+    pub kind: Option<AssetKind>,
+    /// Case-insensitive substring match against the asset name.
+    pub name_contains: Option<String>,
+    /// Require every listed tag to be present (case-insensitive).
+    pub tags: Vec<String>,
+    /// Case-insensitive exact match against the asset media type.
+    pub media_type: Option<String>,
+    /// Include soft-deleted assets in the result.
+    pub include_deleted: bool,
+    /// Maximum number of results; clamped to [`MAX_ASSET_SEARCH_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+impl AssetFilter {
+    /// Return true when `asset` satisfies every configured predicate.
+    pub fn matches(&self, asset: &Asset) -> bool {
+        if let Some(kind) = self.kind {
+            if asset.kind != kind {
+                return false;
+            }
+        }
+        if let Some(name) = &self.name_contains {
+            let needle = name.trim();
+            if !needle.is_empty() && !asset.name.to_lowercase().contains(&needle.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(media_type) = &self.media_type {
+            let needle = media_type.trim();
+            if !needle.is_empty() && !asset.media_type.eq_ignore_ascii_case(needle) {
+                return false;
+            }
+        }
+        for tag in &self.tags {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if !asset
+                .tags
+                .iter()
+                .any(|asset_tag| asset_tag.eq_ignore_ascii_case(tag))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// One asset entry in an integrity audit report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetAuditEntry {
+    pub asset_id: String,
+    pub kind: AssetKind,
+    pub name: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub state: AssetState,
+    pub relative_path: String,
+    pub outcome: AuditOutcome,
+}
+
+/// Result of re-hashing every live asset in one Core.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetAudit {
+    pub schema: String,
+    pub core_uuid: String,
+    pub audited_at: String,
+    pub entries: Vec<AssetAuditEntry>,
+    pub verified: usize,
+    pub missing: usize,
+    pub corrupt: usize,
+}
+
+impl AssetAudit {
+    /// True when every audited asset verified and none were missing or corrupt.
+    pub fn is_clean(&self) -> bool {
+        self.missing == 0 && self.corrupt == 0
+    }
+}
+
+/// One asset entry in a recovery manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetManifestEntry {
+    pub asset_id: String,
+    pub kind: AssetKind,
+    pub name: String,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub state: AssetState,
+    /// Path relative to the owning Core's root directory.
+    pub relative_path: String,
+}
+
+/// Backup/recovery description of every asset owned by one Core.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetManifest {
+    pub schema: String,
+    pub core_uuid: String,
+    pub generated_at: String,
+    pub entries: Vec<AssetManifestEntry>,
 }

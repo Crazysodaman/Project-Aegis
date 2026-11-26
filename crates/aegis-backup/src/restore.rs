@@ -8,11 +8,12 @@ use uuid::Uuid;
 
 use crate::backup::backup;
 use crate::error::BackupError;
-use crate::manifest::BackupManifest;
+use crate::manifest::{BackupManifest, CORE_DATABASE_FILE};
 use crate::pathutil::{
     absolute_path, comparable_path, copy_hashed, copy_new_checked, copy_replace_checked,
     create_private_dir, ensure_no_redirects, hash_file, is_redirected, set_dir_private,
 };
+use crate::percore::verify_database_ownership;
 use crate::state::{
     check_markers, detect_running, open_platform_read_only, open_safe_read_only,
     read_core_identity, verify_core_files,
@@ -354,6 +355,17 @@ fn raw_copy_tree(source: &Path, destination: &Path) -> Result<(), BackupError> {
 
 fn verify_restored_root(root: &Path, manifest: &BackupManifest) -> Result<(), BackupError> {
     check_markers(root)?;
+    for file in &manifest.files {
+        let path = root.join(&file.relative_path);
+        let (sha256, bytes) = hash_file(&path)?;
+        if sha256 != file.sha256 || bytes != file.bytes {
+            return Err(BackupError::DigestMismatch {
+                path,
+                expected: file.sha256.clone(),
+                actual: sha256,
+            });
+        }
+    }
     for core in &manifest.cores {
         let database_file = manifest.file(&core.database_relative_path).ok_or_else(|| {
             BackupError::InvalidBackup(format!("Core {} database is not listed", core.core_uuid))
@@ -399,6 +411,22 @@ fn verify_restored_root(root: &Path, manifest: &BackupManifest) -> Result<(), Ba
             &manifest_path,
             Some(&identity),
         )?;
+
+        for database in &core.databases {
+            if database.file_name == CORE_DATABASE_FILE {
+                continue;
+            }
+            let path = root.join(&database.relative_path);
+            let (sha256, bytes) = hash_file(&path)?;
+            if sha256 != database.sha256 || bytes != database.bytes {
+                return Err(BackupError::DigestMismatch {
+                    path,
+                    expected: database.sha256.clone(),
+                    actual: sha256,
+                });
+            }
+            verify_database_ownership(&core.core_uuid, &path, &database.ownership_table)?;
+        }
     }
     Ok(())
 }

@@ -4,6 +4,46 @@
 //! serves the local IPC endpoint, records a PID/state file, verifies the child
 //! is reachable, and supports bounded graceful shutdown with a forced-kill
 //! fallback. It never starts a Core and never auto-starts at boot.
+//!
+//! [`registration`] adds declarative, side-effect-free systemd and Windows SCM
+//! service definitions. It only renders data; it never installs or controls an
+//! OS service.
+
+pub mod execution;
+pub mod health;
+pub mod logging;
+pub mod registration;
+pub mod runtime;
+pub mod supervision;
+
+pub use execution::{
+    DryRunReport, ExecutionError, ExecutionPrecondition, ExecutionRollback, ExecutionStep,
+    ExecutionVerification, InstallExecutionPlan, PlannedOperation, ServiceInstallExecutor,
+};
+pub use health::{
+    evaluate_health, HealthInputs, HealthLevel, HealthReason, ServiceHealth,
+    DEFAULT_HEARTBEAT_TIMEOUT,
+};
+pub use logging::{
+    journal_integration, JournalIntegration, JournalTransport, LogRetentionConfig, LoggingError,
+    LoggingSpecification, RetentionOwner, DEFAULT_LOG_AGE_SECS, DEFAULT_LOG_BYTES_PER_FILE,
+    DEFAULT_LOG_FILES, DEFAULT_LOG_TOTAL_BYTES, MAX_LOG_AGE_SECS, MAX_LOG_BYTES_PER_FILE,
+    MAX_LOG_FILES, MAX_LOG_TOTAL_BYTES,
+};
+pub use registration::{
+    platform, InstallAction, InstallCommand, InstallPlan, InstallStep, PlatformKind,
+    RegistrationError, RenderedRegistration, RestartPolicy, ServiceCommandSpec, ServicePlatform,
+    ServiceRegistration, ServiceType, ServiceUnit, WindowsServiceSpecs, DEFAULT_SERVICE_NAME,
+    MAX_SERVICE_NAME_LEN, SYSTEMD_UNIT_DIR,
+};
+pub use runtime::{
+    runtime_support, runtime_support_with, OsFamily, RuntimeInputs, RuntimeSupport, RuntimeVerdict,
+    SYSTEMCTL_CANDIDATES, SYSTEMD_RUNTIME_DIR,
+};
+pub use supervision::{
+    plan_restart, Backoff, RestartCondition, RestartDecision, RestartPolicy as SupervisionPolicy,
+    StopReason, SupervisionError,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};

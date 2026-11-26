@@ -26,6 +26,10 @@ pub const RELATIONSHIP_COMPONENT: &str = "social_relationships";
 pub const RELATIONSHIP_SCHEMA: &str = "aegis.social.relationship.v1";
 /// Schema identifier for a relationship event.
 pub const RELATIONSHIP_EVENT_SCHEMA: &str = "aegis.social.relationship_event.v1";
+/// Maximum character length of an explicitly recorded relationship event type.
+pub const MAX_RELATIONSHIP_EVENT_TYPE_CHARS: usize = 64;
+/// Maximum serialized byte length of an explicit relationship event detail.
+pub const MAX_RELATIONSHIP_EVENT_DETAIL_BYTES: usize = 8 * 1024;
 
 /// What kind of entity a relationship refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +82,10 @@ pub struct RelationshipEvent {
     pub event_type: String,
     pub detail: Value,
     pub created_at: String,
+    /// Relationship revision this event was recorded at. Created/updated events
+    /// use the revision they produced; explicitly recorded events advance the
+    /// relationship revision by one before being appended.
+    pub revision: u64,
 }
 
 /// Private relationship store for one Core.
@@ -164,10 +172,11 @@ impl RelationshipStore {
                     existing.relationship_id
                 ],
             )?;
-            self.record_event(
+            self.append_event(
                 &existing.relationship_id,
                 "relationship.updated",
                 &serde_json::json!({"revision": revision, "trust": trust}),
+                revision,
             )?;
             return self.relationship(&existing.relationship_id);
         }
@@ -189,10 +198,11 @@ impl RelationshipStore {
                 now,
             ],
         )?;
-        self.record_event(
+        self.append_event(
             &relationship_id,
             "relationship.created",
             &serde_json::json!({"target_kind": target_kind.as_str(), "target_id": target_id}),
+            1,
         )?;
         self.relationship(&relationship_id)
     }
@@ -233,10 +243,12 @@ impl RelationshipStore {
         let Some(existing) = self.find(target_kind, target_id)? else {
             return Ok(false);
         };
-        self.record_event(
+        let revision = existing.revision.saturating_add(1);
+        self.append_event(
             &existing.relationship_id,
             "relationship.deleted",
             &serde_json::json!({"target_kind": target_kind.as_str()}),
+            revision,
         )?;
         self.connection.execute(
             "DELETE FROM relationships WHERE relationship_id = ?1",
@@ -245,21 +257,77 @@ impl RelationshipStore {
         Ok(true)
     }
 
+    /// Append one explicit event to a relationship and advance its revision.
+    ///
+    /// This is the only supported way to add a caller-defined event (for
+    /// example an interaction or observation). The event is appended, never
+    /// rewritten, and the relationship's `revision` is incremented in the same
+    /// transaction so the event carries the exact revision it produced. The
+    /// caller supplies every field; nothing is inferred from other Cores or
+    /// from group membership.
+    pub fn record_event(
+        &self,
+        target_kind: RelationshipTargetKind,
+        target_id: &str,
+        event_type: &str,
+        detail: Value,
+    ) -> Result<RelationshipEvent, SocialError> {
+        let event_type = validate_event_type(event_type)?;
+        let detail_json = serde_json::to_string(&detail)?;
+        if detail_json.len() > MAX_RELATIONSHIP_EVENT_DETAIL_BYTES {
+            return Err(SocialError::InvalidInput("event detail"));
+        }
+        let existing = self
+            .find(target_kind, target_id)?
+            .ok_or(SocialError::MemberNotFound)?;
+        let revision = existing.revision.saturating_add(1);
+        let revision_db = i64::try_from(revision)
+            .map_err(|_| SocialError::CorruptData("relationship revision"))?;
+        let now = now_rfc3339()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE relationships
+             SET updated_at = ?1, revision = ?2
+             WHERE relationship_id = ?3 AND core_uuid = ?4",
+            params![now, revision_db, existing.relationship_id, self.core_uuid],
+        )?;
+        insert_relationship_event(
+            &transaction,
+            &existing.relationship_id,
+            &event_type,
+            &detail,
+            &now,
+            revision_db,
+        )?;
+        transaction.commit()?;
+        Ok(RelationshipEvent {
+            schema: RELATIONSHIP_EVENT_SCHEMA.to_owned(),
+            relationship_id: existing.relationship_id,
+            event_type,
+            detail,
+            created_at: now,
+            revision,
+        })
+    }
+
     pub fn events(&self, relationship_id: &str) -> Result<Vec<RelationshipEvent>, SocialError> {
         let mut statement = self.connection.prepare(
-            "SELECT event_type, detail_json, created_at FROM relationship_events
+            "SELECT event_type, detail_json, created_at, revision FROM relationship_events
              WHERE relationship_id = ?1 ORDER BY event_id ASC",
         )?;
         let mut rows = statement.query([relationship_id])?;
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
             let detail_json: String = row.get(1)?;
+            let revision: i64 = row.get(3)?;
             events.push(RelationshipEvent {
                 schema: RELATIONSHIP_EVENT_SCHEMA.to_owned(),
                 relationship_id: relationship_id.to_owned(),
                 event_type: row.get(0)?,
                 detail: serde_json::from_str(&detail_json)?,
                 created_at: row.get(2)?,
+                revision: u64::try_from(revision)
+                    .map_err(|_| SocialError::CorruptData("relationship event revision"))?,
             });
         }
         Ok(events)
@@ -284,26 +352,48 @@ impl RelationshipStore {
             .optional()?)
     }
 
-    fn record_event(
+    fn append_event(
         &self,
         relationship_id: &str,
         event_type: &str,
         detail: &Value,
+        revision: u64,
     ) -> Result<(), SocialError> {
-        self.connection.execute(
-            "INSERT INTO relationship_events(
-                relationship_id, schema, event_type, detail_json, created_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![
-                relationship_id,
-                RELATIONSHIP_EVENT_SCHEMA,
-                event_type,
-                serde_json::to_string(detail)?,
-                now_rfc3339()?
-            ],
-        )?;
-        Ok(())
+        let revision = i64::try_from(revision)
+            .map_err(|_| SocialError::CorruptData("relationship revision"))?;
+        insert_relationship_event(
+            &self.connection,
+            relationship_id,
+            event_type,
+            detail,
+            &now_rfc3339()?,
+            revision,
+        )
     }
+}
+
+fn insert_relationship_event(
+    connection: &Connection,
+    relationship_id: &str,
+    event_type: &str,
+    detail: &Value,
+    created_at: &str,
+    revision: i64,
+) -> Result<(), SocialError> {
+    connection.execute(
+        "INSERT INTO relationship_events(
+            relationship_id, schema, event_type, detail_json, created_at, revision
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            relationship_id,
+            RELATIONSHIP_EVENT_SCHEMA,
+            event_type,
+            serde_json::to_string(detail)?,
+            created_at,
+            revision
+        ],
+    )?;
+    Ok(())
 }
 
 fn ensure_tables(connection: &Connection) -> Result<(), SocialError> {
@@ -334,7 +424,8 @@ fn ensure_tables(connection: &Connection) -> Result<(), SocialError> {
             schema TEXT NOT NULL,
             event_type TEXT NOT NULL,
             detail_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS relationship_events_by_relationship
             ON relationship_events(relationship_id, event_id);
@@ -359,6 +450,29 @@ fn ensure_tables(connection: &Connection) -> Result<(), SocialError> {
             SELECT RAISE(ABORT, 'relationship events are append-only');
         END;",
     )?;
+    ensure_event_revision_column(connection)?;
+    Ok(())
+}
+
+fn ensure_event_revision_column(connection: &Connection) -> Result<(), SocialError> {
+    let mut has_revision = false;
+    {
+        let mut statement = connection.prepare("PRAGMA table_info(relationship_events)")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "revision" {
+                has_revision = true;
+                break;
+            }
+        }
+    }
+    if !has_revision {
+        connection.execute(
+            "ALTER TABLE relationship_events ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -457,6 +571,16 @@ fn validate_text(value: &str, maximum: usize, field: &'static str) -> Result<Str
     if trimmed.is_empty() || value.chars().count() > maximum || value.chars().any(char::is_control)
     {
         return Err(SocialError::InvalidInput(field));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_event_type(value: &str) -> Result<String, SocialError> {
+    if value.trim().is_empty()
+        || value.chars().count() > MAX_RELATIONSHIP_EVENT_TYPE_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(SocialError::InvalidInput("event type"));
     }
     Ok(value.to_owned())
 }

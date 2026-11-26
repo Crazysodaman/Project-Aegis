@@ -3,24 +3,32 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use aegis_contracts::integrity::IntegrityStatus;
-use aegis_core_integrity::verify_core;
+use aegis_core_integrity::{
+    compute_identity_sha256, seal_manifest_with_metadata, verify_core, IntegrityManifestStore,
+};
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_storage::StoragePaths;
 use chrono::Utc;
+use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
 
+use crate::assets::{collect_asset_files, AssetFile};
 use crate::error::BackupError;
 use crate::manifest::{
-    BackupCore, BackupFile, BackupFileKind, BackupManifest, BACKUP_FORMAT_VERSION,
-    BACKUP_MANIFEST_FILE, BACKUP_MANIFEST_SCHEMA,
+    BackupCore, BackupDatabase, BackupFile, BackupFileKind, BackupManifest, BACKUP_FORMAT_VERSION,
+    BACKUP_MANIFEST_FILE, BACKUP_MANIFEST_SCHEMA, CORE_DATABASE_FILE,
 };
 use crate::pathutil::{
     absolute_path, comparable_path, copy_hashed, create_private_dir, hash_file, is_redirected,
     require_regular_file, set_dir_private, set_file_private,
 };
+use crate::percore::{
+    verify_core_database_ownership, verify_database_ownership, SidecarDatabase, SIDECAR_DATABASES,
+};
+use crate::snapshot::{sidecar_path, vacuum_into};
 use crate::state::{
-    detect_running, open_safe_read_only, read_core_identity, read_core_registry,
-    read_platform_identity, verify_core_files, RegistryCore,
+    detect_running, open_safe_read_only, read_core_identity, read_core_instance_uuid,
+    read_core_registry, read_platform_identity, verify_core_files, RegistryCore,
 };
 
 /// Result of a successful backup.
@@ -30,15 +38,22 @@ pub struct BackupReport {
     pub destination: PathBuf,
     pub total_bytes: u64,
     pub file_count: usize,
+    /// Optional per-Core databases that did not exist and were therefore not
+    /// copied, expressed as manifest-relative paths.
+    pub missing_databases: Vec<String>,
 }
 
 struct PreparedCore {
     registry: RegistryCore,
     identity: aegis_contracts::core::CoreIdentity,
     schema_revision: u64,
+    initialization_mode: String,
     database_path: PathBuf,
-    manifest_path: PathBuf,
     initialization_marker: Option<PathBuf>,
+    database_instance_uuid: Option<String>,
+    sidecar_databases: Vec<(&'static SidecarDatabase, PathBuf)>,
+    missing_databases: Vec<String>,
+    asset_files: Vec<AssetFile>,
 }
 
 /// Back up a Platform storage root into a new directory.
@@ -126,21 +141,25 @@ pub fn backup(
         }
         let manifest_path = layout.integrity_path(&core.core_uuid)?;
         require_regular_file(&manifest_path)?;
-        let report = verify_core(
-            &core.core_uuid,
-            &snapshot.database_path,
-            &manifest_path,
-            snapshot.metadata.schema_revision,
-            Some(&snapshot.identity),
-        );
-        if report.status != IntegrityStatus::Verified {
-            return Err(BackupError::IntegrityFailed {
-                core_uuid: core.core_uuid.clone(),
-                status: report.status,
-                detail: report
-                    .detail
-                    .unwrap_or_else(|| "integrity verification failed".to_owned()),
-            });
+        if sidecar_path(&snapshot.database_path).is_some() {
+            verify_live_core_source(core, &snapshot, &manifest_path)?;
+        } else {
+            let report = verify_core(
+                &core.core_uuid,
+                &snapshot.database_path,
+                &manifest_path,
+                snapshot.metadata.schema_revision,
+                Some(&snapshot.identity),
+            );
+            if report.status != IntegrityStatus::Verified {
+                return Err(BackupError::IntegrityFailed {
+                    core_uuid: core.core_uuid.clone(),
+                    status: report.status,
+                    detail: report
+                        .detail
+                        .unwrap_or_else(|| "integrity verification failed".to_owned()),
+                });
+            }
         }
         let marker_path = layout.initialization_marker_path(&core.core_uuid)?;
         let initialization_marker = match fs::symlink_metadata(&marker_path) {
@@ -159,13 +178,46 @@ pub fn backup(
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
+
+        let database_instance_uuid = read_core_instance_uuid(&snapshot.database_path)?;
+        let core_dir = layout.core_dir(&core.core_uuid)?;
+        let mut sidecar_databases = Vec::new();
+        let mut missing_databases = Vec::new();
+        for spec in SIDECAR_DATABASES {
+            let path = core_dir.join(spec.file_name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if is_redirected(&metadata) {
+                        return Err(BackupError::UnsafePath(format!(
+                            "{} is a symlink or reparse point",
+                            path.display()
+                        )));
+                    }
+                    if !metadata.is_file() {
+                        return Err(BackupError::UnsupportedFile(path));
+                    }
+                    verify_database_ownership(&core.core_uuid, &path, spec.ownership_table)?;
+                    sidecar_databases.push((spec, path));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing_databases.push(spec.file_name.to_owned());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let asset_files = collect_asset_files(&core_dir, &core.core_uuid)?;
+
         prepared.push(PreparedCore {
             registry: core.clone(),
             identity: snapshot.identity,
             schema_revision: snapshot.metadata.schema_revision,
+            initialization_mode: snapshot.metadata.initialization_mode,
             database_path: snapshot.database_path,
-            manifest_path,
             initialization_marker,
+            database_instance_uuid,
+            sidecar_databases,
+            missing_databases,
+            asset_files,
         });
     }
 
@@ -173,13 +225,13 @@ pub fn backup(
     set_dir_private(&destination)?;
 
     let mut files = Vec::new();
-    files.push(copy_backup_file(
+    files.push(snapshot_database_file(
         &platform_db,
         &destination,
         "platform.db",
         BackupFileKind::PlatformDatabase,
     )?);
-    files.push(copy_backup_file(
+    files.push(snapshot_database_file(
         &safe_db,
         &destination,
         "safe.db",
@@ -193,36 +245,18 @@ pub fn backup(
     )?);
 
     let mut backup_cores = Vec::with_capacity(prepared.len());
+    let mut missing_databases = Vec::new();
     for core in &prepared {
         let core_uuid = &core.registry.core_uuid;
         let database_relative = format!("cores/{core_uuid}/core.db");
         let manifest_relative = format!("cores/{core_uuid}/core.integrity.json");
 
-        let database_file = copy_backup_file(
+        let database_file = snapshot_database_file(
             &core.database_path,
             &destination,
             &database_relative,
             BackupFileKind::CoreDatabase,
         )?;
-        let manifest_file = copy_backup_file(
-            &core.manifest_path,
-            &destination,
-            &manifest_relative,
-            BackupFileKind::CoreIntegrityManifest,
-        )?;
-
-        let marker_file = match &core.initialization_marker {
-            Some(marker) => {
-                let relative = format!("init/{core_uuid}.initialization.marker");
-                Some(copy_backup_file(
-                    marker,
-                    &destination,
-                    &relative,
-                    BackupFileKind::CoreInitializationMarker,
-                )?)
-            }
-            None => None,
-        };
 
         let copied_database = destination.join(&database_relative);
         let copied_manifest = destination.join(&manifest_relative);
@@ -237,6 +271,22 @@ pub fn backup(
                 detail: "copied Core identity does not match the source identity".to_owned(),
             });
         }
+        verify_core_database_ownership(
+            core_uuid,
+            &copied_database,
+            core.database_instance_uuid.as_deref(),
+        )?;
+        let copied_instance = read_core_instance_uuid(&copied_database)?;
+        if copied_instance != core.database_instance_uuid {
+            return Err(BackupError::IntegrityFailed {
+                core_uuid: core_uuid.clone(),
+                status: IntegrityStatus::OwnershipMismatch,
+                detail: "copied database instance UUID does not match the source".to_owned(),
+            });
+        }
+
+        let manifest_file = seal_snapshot_manifest(core, &destination, &manifest_relative)?;
+
         let (integrity_manifest, report) = verify_core_files(
             core_uuid,
             &copied_database,
@@ -252,6 +302,81 @@ pub fn backup(
                 detail: "copied database digest does not match its integrity manifest".to_owned(),
             });
         }
+        if let (Some(source_instance), Some(manifest_instance)) =
+            (&copied_instance, &integrity_manifest.database_instance_uuid)
+        {
+            if source_instance != manifest_instance {
+                return Err(BackupError::IntegrityFailed {
+                    core_uuid: core_uuid.clone(),
+                    status: IntegrityStatus::OwnershipMismatch,
+                    detail: "database instance UUID does not match the integrity manifest"
+                        .to_owned(),
+                });
+            }
+        }
+
+        let mut databases = vec![BackupDatabase {
+            file_name: CORE_DATABASE_FILE.to_owned(),
+            relative_path: database_relative.clone(),
+            kind: BackupFileKind::CoreDatabase,
+            ownership_table: aegis_contracts::core::CORE_IDENTITY_TABLE.to_owned(),
+            sha256: database_file.sha256.clone(),
+            bytes: database_file.bytes,
+        }];
+
+        let database_sha256 = database_file.sha256.clone();
+        let manifest_sha256 = manifest_file.sha256.clone();
+        files.push(database_file);
+        files.push(manifest_file);
+
+        for (spec, path) in &core.sidecar_databases {
+            let relative = format!("cores/{core_uuid}/{}", spec.file_name);
+            let file = snapshot_database_file(path, &destination, &relative, spec.kind)?;
+            verify_database_ownership(
+                core_uuid,
+                &destination.join(&relative),
+                spec.ownership_table,
+            )?;
+            databases.push(BackupDatabase {
+                file_name: spec.file_name.to_owned(),
+                relative_path: relative,
+                kind: spec.kind,
+                ownership_table: spec.ownership_table.to_owned(),
+                sha256: file.sha256.clone(),
+                bytes: file.bytes,
+            });
+            files.push(file);
+        }
+
+        for asset in &core.asset_files {
+            let file = copy_backup_file(
+                &asset.absolute,
+                &destination,
+                &asset.relative_path,
+                BackupFileKind::CoreAssetFile,
+            )?;
+            files.push(file);
+        }
+
+        let marker_file = match &core.initialization_marker {
+            Some(marker) => {
+                let relative = format!("init/{core_uuid}.initialization.marker");
+                Some(copy_backup_file(
+                    marker,
+                    &destination,
+                    &relative,
+                    BackupFileKind::CoreInitializationMarker,
+                )?)
+            }
+            None => None,
+        };
+        if let Some(marker_file) = marker_file {
+            files.push(marker_file);
+        }
+
+        for name in &core.missing_databases {
+            missing_databases.push(format!("cores/{core_uuid}/{name}"));
+        }
 
         backup_cores.push(BackupCore {
             core_uuid: core_uuid.clone(),
@@ -260,15 +385,12 @@ pub fn backup(
             lifecycle_state: core.registry.lifecycle_state.as_str().to_owned(),
             database_relative_path: database_relative,
             manifest_relative_path: manifest_relative,
-            database_sha256: database_file.sha256.clone(),
-            manifest_sha256: manifest_file.sha256.clone(),
+            database_sha256,
+            manifest_sha256,
             integrity_status: report.status.as_str().to_owned(),
+            databases,
+            missing_optional_databases: core.missing_databases.clone(),
         });
-        files.push(database_file);
-        files.push(manifest_file);
-        if let Some(marker_file) = marker_file {
-            files.push(marker_file);
-        }
     }
 
     let total_bytes = files.iter().map(|file| file.bytes).sum();
@@ -290,6 +412,160 @@ pub fn backup(
         destination,
         total_bytes,
         file_count,
+        missing_databases,
+    })
+}
+
+fn verify_live_core_source(
+    core: &RegistryCore,
+    snapshot: &aegis_core_storage::CoreStorageSnapshot,
+    manifest_path: &Path,
+) -> Result<(), BackupError> {
+    let connection =
+        Connection::open_with_flags(&snapshot.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let check: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if check != "ok" {
+        return Err(BackupError::IntegrityFailed {
+            core_uuid: core.core_uuid.clone(),
+            status: IntegrityStatus::SqliteCorrupt,
+            detail: format!("live SQLite integrity_check reported: {check}"),
+        });
+    }
+    drop(connection);
+
+    let manifest = IntegrityManifestStore::new(manifest_path)
+        .read()?
+        .ok_or_else(|| BackupError::IntegrityFailed {
+            core_uuid: core.core_uuid.clone(),
+            status: IntegrityStatus::MissingManifest,
+            detail: format!(
+                "integrity manifest is missing at {}",
+                manifest_path.display()
+            ),
+        })?;
+    if manifest.core_uuid != core.core_uuid {
+        return Err(BackupError::IntegrityFailed {
+            core_uuid: core.core_uuid.clone(),
+            status: IntegrityStatus::OwnershipMismatch,
+            detail: "integrity manifest belongs to another Core".to_owned(),
+        });
+    }
+    let identity_sha256 = compute_identity_sha256(&snapshot.identity)?;
+    if manifest.identity_sha256 != identity_sha256 {
+        return Err(BackupError::IntegrityFailed {
+            core_uuid: core.core_uuid.clone(),
+            status: IntegrityStatus::OwnershipMismatch,
+            detail: "integrity manifest identity does not match the live Core identity".to_owned(),
+        });
+    }
+
+    verify_core_database_ownership(
+        &core.core_uuid,
+        &snapshot.database_path,
+        Some(&snapshot.metadata.database_instance_uuid),
+    )
+}
+
+fn snapshot_database_file(
+    source: &Path,
+    destination_root: &Path,
+    relative: &str,
+    kind: BackupFileKind,
+) -> Result<BackupFile, BackupError> {
+    let destination = destination_root.join(relative);
+    let parent = destination.parent().ok_or_else(|| {
+        BackupError::UnsafePath(format!("{} has no parent directory", destination.display()))
+    })?;
+    create_private_dir(parent)?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BackupError::UnsafePath(format!("{} has no valid file name", destination.display()))
+        })?;
+    let temporary = parent.join(format!(
+        ".{file_name}.aegis-backup-{}",
+        Uuid::new_v4().simple()
+    ));
+
+    let result = (|| -> Result<(String, u64), BackupError> {
+        match vacuum_into(source, &temporary) {
+            Ok(result) => Ok(result),
+            Err(snapshot_error) => {
+                let _ = fs::remove_file(&temporary);
+                if let Some(sidecar) = sidecar_path(source) {
+                    return Err(BackupError::InvalidSource(format!(
+                        "live SQLite database {} has sidecar {} and could not be snapshotted consistently: {snapshot_error}",
+                        source.display(),
+                        sidecar.display()
+                    )));
+                }
+                copy_hashed(source, &temporary)
+            }
+        }
+    })();
+
+    let (digest, bytes) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+
+    let finish = (|| -> Result<(), BackupError> {
+        set_file_private(&temporary)?;
+        fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if let Err(error) = finish {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    Ok(BackupFile {
+        relative_path: relative.to_owned(),
+        sha256: digest,
+        bytes,
+        kind,
+    })
+}
+
+fn seal_snapshot_manifest(
+    core: &PreparedCore,
+    destination_root: &Path,
+    manifest_relative: &str,
+) -> Result<BackupFile, BackupError> {
+    let core_uuid = &core.registry.core_uuid;
+    let database_relative = format!("cores/{core_uuid}/{CORE_DATABASE_FILE}");
+    let database_path = destination_root.join(&database_relative);
+    let manifest_path = destination_root.join(manifest_relative);
+    let parent = manifest_path.parent().ok_or_else(|| {
+        BackupError::UnsafePath(format!(
+            "{} has no parent directory",
+            manifest_path.display()
+        ))
+    })?;
+    create_private_dir(parent)?;
+
+    seal_manifest_with_metadata(
+        core_uuid,
+        &database_path,
+        &manifest_path,
+        core.schema_revision,
+        &core.identity,
+        core.database_instance_uuid.as_deref(),
+        Some(&core.initialization_mode),
+        Some(core.registry.core_number),
+    )?;
+    set_file_private(&manifest_path)?;
+
+    let (sha256, bytes) = hash_file(&manifest_path)?;
+    Ok(BackupFile {
+        relative_path: manifest_relative.to_owned(),
+        sha256,
+        bytes,
+        kind: BackupFileKind::CoreIntegrityManifest,
     })
 }
 
@@ -300,19 +576,39 @@ fn copy_backup_file(
     kind: BackupFileKind,
 ) -> Result<BackupFile, BackupError> {
     let destination = destination_root.join(relative);
-    if let Some(parent) = destination.parent() {
-        create_private_dir(parent)?;
-    }
+    let parent = destination.parent().ok_or_else(|| {
+        BackupError::UnsafePath(format!("{} has no parent directory", destination.display()))
+    })?;
+    create_private_dir(parent)?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BackupError::UnsafePath(format!("{} has no valid file name", destination.display()))
+        })?;
+    let temporary = parent.join(format!(
+        ".{file_name}.aegis-backup-{}",
+        Uuid::new_v4().simple()
+    ));
+
     let (source_hash, source_bytes) = hash_file(source)?;
-    let (copied_hash, copied_bytes) = copy_hashed(source, &destination)?;
-    if source_hash != copied_hash || source_bytes != copied_bytes {
-        return Err(BackupError::DigestMismatch {
-            path: source.to_path_buf(),
-            expected: source_hash,
-            actual: copied_hash,
-        });
+    let result = (|| -> Result<(String, u64), BackupError> {
+        let (copied_hash, copied_bytes) = copy_hashed(source, &temporary)?;
+        if source_hash != copied_hash || source_bytes != copied_bytes {
+            return Err(BackupError::DigestMismatch {
+                path: source.to_path_buf(),
+                expected: source_hash.clone(),
+                actual: copied_hash,
+            });
+        }
+        set_file_private(&temporary)?;
+        fs::rename(&temporary, &destination)?;
+        Ok((copied_hash, copied_bytes))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    set_file_private(&destination)?;
+    let (copied_hash, copied_bytes) = result?;
     Ok(BackupFile {
         relative_path: relative.to_owned(),
         sha256: copied_hash,

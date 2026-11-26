@@ -23,6 +23,14 @@ pub const GROUP_MEMBER_SCHEMA: &str = "aegis.social.group_member.v1";
 pub const GROUP_MESSAGE_SCHEMA: &str = "aegis.social.group_message.v1";
 /// Schema identifier for a group event.
 pub const GROUP_EVENT_SCHEMA: &str = "aegis.social.group_event.v1";
+/// Schema identifier for a Core-scoped group context read.
+pub const GROUP_CONTEXT_SCHEMA: &str = "aegis.social.core_context.v1";
+/// Schema identifier for a bounded group activity summary.
+pub const GROUP_ACTIVITY_SCHEMA: &str = "aegis.social.group_activity.v1";
+/// Schema identifier for a per-Core participation summary.
+pub const PARTICIPATION_SUMMARY_SCHEMA: &str = "aegis.social.participation_summary.v1";
+/// Schema identifier for one participation membership entry.
+pub const PARTICIPATION_ENTRY_SCHEMA: &str = "aegis.social.participation_entry.v1";
 /// Maximum group name length.
 pub const MAX_GROUP_NAME_CHARS: usize = 160;
 /// Maximum message length in characters.
@@ -124,6 +132,68 @@ pub struct GroupEvent {
     pub event_type: String,
     pub detail: Value,
     pub created_at: String,
+}
+
+/// A membership-scoped, read-only context window for one Core.
+///
+/// This projection intentionally contains only messages that are visible to
+/// every member of the group. Per-Core relationship records live in each Core's
+/// own `social.db` and are never joined, copied, or summarized here, so a group
+/// read cannot expose another Core's private relationship data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreGroupContext {
+    pub schema: String,
+    pub group_id: String,
+    pub core_uuid: String,
+    pub messages: Vec<GroupMessage>,
+}
+
+/// Bounded, client-facing activity summary for a group.
+///
+/// The summary exposes only counts and timestamps that the group store already
+/// owns. It makes no claim about trust, awareness, or relationship state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupActivitySummary {
+    pub schema: String,
+    pub group_id: String,
+    pub member_count: u64,
+    pub message_count: u64,
+    pub last_message_id: Option<u64>,
+    pub last_message_at: Option<String>,
+    pub last_activity_at: String,
+    pub revision: u64,
+}
+
+/// One group membership inside a per-Core participation summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupParticipation {
+    pub schema: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub joined_at: String,
+    /// Messages authored by this Core in this group only.
+    pub message_count: u64,
+    /// Latest activity attributable to this Core: last authored message, or the
+    /// membership join time when the Core has not posted yet.
+    pub last_activity_at: String,
+}
+
+/// Per-Core participation projection derived only from current membership rows
+/// and group-shared messages authored by the requesting Core.
+///
+/// Membership is enforced by the query: only groups where this Core is a current
+/// member appear. The projection never opens, joins, reads, or summarizes any
+/// Core's private `social.db`, so another Core's relationship `label`, `trust`,
+/// `notes`, or `tags` cannot leak through it. It infers no trust or personality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationSummary {
+    pub schema: String,
+    pub core_uuid: String,
+    pub generated_at: String,
+    pub group_count: u64,
+    pub message_count: u64,
+    pub last_activity_at: Option<String>,
+    pub memberships: Vec<GroupParticipation>,
 }
 
 /// Platform-owned group store.
@@ -415,6 +485,179 @@ impl GroupStore {
             messages.push(read_message(row, group_id)?);
         }
         Ok(messages)
+    }
+
+    /// Recent group messages for one Core, gated by live membership.
+    ///
+    /// The Core must currently be a member of `group_id`; a non-member or a
+    /// removed member receives [`SocialError::NotMember`] immediately because
+    /// membership is re-checked on every call. Messages are returned in
+    /// chronological order and the window is bounded by [`MAX_GROUP_MESSAGES`].
+    ///
+    /// This is the only supported way for a Core to read shared group context.
+    /// It never reads the per-Core relationship database, so private
+    /// relationship fields (label, trust, notes, tags) cannot leak between
+    /// Cores through a group read.
+    pub fn context_for_core(
+        &self,
+        core_uuid: &str,
+        group_id: &str,
+        limit: usize,
+    ) -> Result<CoreGroupContext, SocialError> {
+        let actor = SocialActor::core(core_uuid)?;
+        validate_actor(&actor)?;
+        let connection = self.open()?;
+        require_group(&connection, group_id)?;
+        require_access(&connection, group_id, &actor)?;
+        let limit = limit.clamp(1, MAX_GROUP_MESSAGES);
+        let mut statement = connection.prepare(
+            "SELECT message_id, sender_kind, sender_id, content, created_at
+             FROM social_group_messages WHERE group_id = ?1
+             ORDER BY message_id DESC LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![group_id, limit as i64])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(read_message(row, group_id)?);
+        }
+        messages.reverse();
+        Ok(CoreGroupContext {
+            schema: GROUP_CONTEXT_SCHEMA.to_owned(),
+            group_id: group_id.to_owned(),
+            core_uuid: actor.id,
+            messages,
+        })
+    }
+
+    /// Counts and timestamps describing recent group activity.
+    ///
+    /// Only group-owned aggregates are returned. Access is enforced exactly like
+    /// any other group read: the owner may inspect any group and a Core must be
+    /// a current member.
+    pub fn activity_summary(
+        &self,
+        group_id: &str,
+        actor: &SocialActor,
+    ) -> Result<GroupActivitySummary, SocialError> {
+        validate_actor(actor)?;
+        let connection = self.open()?;
+        require_group(&connection, group_id)?;
+        require_access(&connection, group_id, actor)?;
+        connection
+            .query_row(
+                "SELECT g.updated_at, g.revision,
+                        (SELECT COUNT(*) FROM social_group_members m
+                         WHERE m.group_id = g.group_id),
+                        (SELECT COUNT(*) FROM social_group_messages msg
+                         WHERE msg.group_id = g.group_id),
+                        (SELECT MAX(msg.message_id) FROM social_group_messages msg
+                         WHERE msg.group_id = g.group_id),
+                        (SELECT msg.created_at FROM social_group_messages msg
+                         WHERE msg.group_id = g.group_id
+                         ORDER BY msg.message_id DESC LIMIT 1)
+                 FROM social_groups g WHERE g.group_id = ?1",
+                [group_id],
+                |row| {
+                    let revision: i64 = row.get(1)?;
+                    let member_count: i64 = row.get(2)?;
+                    let message_count: i64 = row.get(3)?;
+                    let last_message_id: Option<i64> = row.get(4)?;
+                    if revision < 1 || member_count < 0 || message_count < 0 {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            1,
+                            "group activity bounds".to_owned(),
+                            rusqlite::types::Type::Integer,
+                        ));
+                    }
+                    let last_message_id = match last_message_id {
+                        Some(value) => Some(u64::try_from(value).map_err(|_| {
+                            rusqlite::Error::InvalidColumnType(
+                                4,
+                                "last_message_id".to_owned(),
+                                rusqlite::types::Type::Integer,
+                            )
+                        })?),
+                        None => None,
+                    };
+                    Ok(GroupActivitySummary {
+                        schema: GROUP_ACTIVITY_SCHEMA.to_owned(),
+                        group_id: group_id.to_owned(),
+                        member_count: member_count as u64,
+                        message_count: message_count as u64,
+                        last_message_id,
+                        last_message_at: row.get(5)?,
+                        last_activity_at: row.get(0)?,
+                        revision: revision as u64,
+                    })
+                },
+            )
+            .map_err(SocialError::from)
+    }
+
+    /// Membership-enforced participation summary for one Core.
+    ///
+    /// Only groups where `core_uuid` is a current member are included. Counts
+    /// cover messages authored by that Core; shared group content is never
+    /// attributed to another Core. The per-Core relationship database is not
+    /// opened, so private relationship data of any Core cannot leak here.
+    pub fn participation_summary(
+        &self,
+        core_uuid: &str,
+    ) -> Result<ParticipationSummary, SocialError> {
+        let actor = SocialActor::core(core_uuid)?;
+        validate_actor(&actor)?;
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT g.group_id, g.name, m.joined_at,
+                    (SELECT COUNT(*) FROM social_group_messages msg
+                     WHERE msg.group_id = g.group_id
+                       AND msg.sender_kind = 'core' AND msg.sender_id = ?1),
+                    (SELECT MAX(msg.created_at) FROM social_group_messages msg
+                     WHERE msg.group_id = g.group_id
+                       AND msg.sender_kind = 'core' AND msg.sender_id = ?1)
+             FROM social_groups g
+             JOIN social_group_members m ON m.group_id = g.group_id
+             WHERE m.member_kind = 'core' AND m.member_id = ?1
+             ORDER BY m.joined_at ASC, g.group_id ASC",
+        )?;
+        let mut rows = statement.query([actor.id.as_str()])?;
+        let mut memberships = Vec::new();
+        let mut message_count = 0u64;
+        let mut last_activity_at: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            let group_id: String = row.get(0)?;
+            let group_name: String = row.get(1)?;
+            let joined_at: String = row.get(2)?;
+            let authored: i64 = row.get(3)?;
+            let last_message_at: Option<String> = row.get(4)?;
+            if authored < 0 {
+                return Err(SocialError::CorruptData("participation message count"));
+            }
+            let authored = authored as u64;
+            let last_activity = last_message_at.unwrap_or_else(|| joined_at.clone());
+            message_count = message_count.saturating_add(authored);
+            last_activity_at = match last_activity_at {
+                Some(current) => Some(current.max(last_activity.clone())),
+                None => Some(last_activity.clone()),
+            };
+            memberships.push(GroupParticipation {
+                schema: PARTICIPATION_ENTRY_SCHEMA.to_owned(),
+                group_id,
+                group_name,
+                joined_at,
+                message_count: authored,
+                last_activity_at: last_activity,
+            });
+        }
+        Ok(ParticipationSummary {
+            schema: PARTICIPATION_SUMMARY_SCHEMA.to_owned(),
+            core_uuid: actor.id,
+            generated_at: now_rfc3339()?,
+            group_count: memberships.len() as u64,
+            message_count,
+            last_activity_at,
+            memberships,
+        })
     }
 
     pub fn events(

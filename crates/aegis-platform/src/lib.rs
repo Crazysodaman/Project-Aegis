@@ -2,9 +2,21 @@
 
 mod service;
 mod store;
+mod weather;
+mod world;
 
 pub use service::{InitializationResult, PlatformService, ServiceError};
 pub use store::{PlatformIdentity, PlatformStore};
+pub use weather::{
+    parse_open_meteo, wmo_condition, OpenMeteoProvider, OPEN_METEO_CACHE_TTL_SECONDS,
+    OPEN_METEO_ENDPOINT, OPEN_METEO_PROVIDER_NAME,
+};
+pub use world::{
+    UnavailableWeatherProvider, WeatherData, WeatherProvider, WeatherRequest, WeatherUnavailable,
+    WorldClock, WorldClockReading, WorldConfig, WorldError, WorldService, WorldStore,
+    CONFIG_LATITUDE, CONFIG_LONGITUDE, CONFIG_STALE_AFTER_SECONDS, CONFIG_TIMEZONE,
+    DEFAULT_STALE_AFTER_SECONDS, DEFAULT_TIMEZONE,
+};
 
 use thiserror::Error;
 

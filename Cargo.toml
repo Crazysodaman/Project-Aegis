@@ -69,6 +69,7 @@ aegis-host = { path = "crates/aegis-host" }
 aegis-ui = { path = "crates/aegis-ui" }
 aegis-service = { path = "crates/aegis-service" }
 chrono = { version = "=0.4.40", default-features = false, features = ["clock", "std"] }
+chrono-tz = "=0.10.0"
 getrandom = "=0.2.17"
 interprocess = "=2.2.3"
 rusqlite = { version = "=0.32.1", features = ["bundled"] }

@@ -17,7 +17,12 @@ use std::path::Path;
 use aegis_cognition::{
     CancelToken, ChatMessage, ChatRequest, ChatResponse, ChatRole, ModelProvider, ToolCall,
 };
-use aegis_core_sdk::{CoreSdkContext, MemoryEntry, PersonalityProfile};
+use aegis_contracts::personal::{Activity, ContinuitySummary, EmotionState};
+use aegis_contracts::world::{FreshnessState, WorldSnapshot};
+use aegis_core_sdk::{
+    apply_interaction_event as apply_personal_interaction_event, CoreSdkContext, EventApplication,
+    InteractionEvent, MemoryEntry, PersonalityProfile,
+};
 use aegis_tools::ToolExecutor;
 
 use crate::error::ConversationError;
@@ -34,6 +39,10 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 6;
 pub const MAX_SYSTEM_PROMPT_CHARS: usize = 8_000;
 /// Maximum characters of one memory snippet.
 pub const MAX_MEMORY_SNIPPET_CHARS: usize = 400;
+/// Maximum rendered characters for one bounded prompt list item.
+const MAX_PROMPT_ITEM_CHARS: usize = 160;
+/// Maximum list items rendered per prompt section.
+const MAX_PROMPT_LIST_ITEMS: usize = 6;
 
 /// Per-turn assembly options.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +55,14 @@ pub struct TurnOptions {
     pub timeout_ms: Option<u64>,
     pub think: Option<bool>,
     pub system_instructions: Option<String>,
+    /// Shared, authority-free world snapshot supplied by the Platform clock.
+    pub world: Option<WorldSnapshot>,
+    /// This Core's bounded continuity summary from its personal store.
+    pub continuity: Option<ContinuitySummary>,
+    /// This Core's internal emotional state (descriptive only).
+    pub emotion: Option<EmotionState>,
+    /// Additional activities to surface in the prompt.
+    pub activities: Vec<Activity>,
 }
 
 impl TurnOptions {
@@ -59,6 +76,10 @@ impl TurnOptions {
             timeout_ms: None,
             think: None,
             system_instructions: None,
+            world: None,
+            continuity: None,
+            emotion: None,
+            activities: Vec::new(),
         }
     }
 
@@ -96,6 +117,30 @@ impl TurnOptions {
         self.think = think;
         self
     }
+
+    /// Attach a shared world snapshot to the assembled system prompt.
+    pub fn with_world(mut self, world: WorldSnapshot) -> Self {
+        self.world = Some(world);
+        self
+    }
+
+    /// Attach this Core's continuity summary to the assembled system prompt.
+    pub fn with_continuity(mut self, continuity: ContinuitySummary) -> Self {
+        self.continuity = Some(continuity);
+        self
+    }
+
+    /// Attach this Core's internal emotional state to the assembled prompt.
+    pub fn with_emotion(mut self, emotion: EmotionState) -> Self {
+        self.emotion = Some(emotion);
+        self
+    }
+
+    /// Attach additional activities to the assembled system prompt.
+    pub fn with_activities(mut self, activities: Vec<Activity>) -> Self {
+        self.activities = activities;
+        self
+    }
 }
 
 /// One memory entry referenced by an assembled turn.
@@ -115,6 +160,10 @@ pub struct PreparedTurn {
     pub memory_used: Vec<MemoryReference>,
     pub retrieval_method: String,
     pub retrieval_semantic: bool,
+    pub world_used: bool,
+    pub continuity_used: bool,
+    pub emotion_used: bool,
+    pub activities_used: bool,
 }
 
 /// A completed non-streaming or streamed turn.
@@ -127,6 +176,16 @@ pub struct ConversationTurn {
     pub memory_used: Vec<MemoryReference>,
     pub retrieval_method: String,
     pub retrieval_semantic: bool,
+    pub world_used: bool,
+    pub continuity_used: bool,
+    pub emotion_used: bool,
+    pub activities_used: bool,
+    /// Non-fatal warning if the post-turn personal-continuity update failed.
+    pub personal_update_warning: Option<String>,
+    /// Whether the deterministic post-turn interaction event was newly applied.
+    pub interaction_applied: bool,
+    /// Non-fatal warning if the post-turn interaction event update failed.
+    pub interaction_warning: Option<String>,
 }
 
 /// Result of executing one model-proposed tool call.
@@ -149,6 +208,16 @@ pub struct AssistantTurn {
     pub memory_used: Vec<MemoryReference>,
     pub retrieval_method: String,
     pub retrieval_semantic: bool,
+    pub world_used: bool,
+    pub continuity_used: bool,
+    pub emotion_used: bool,
+    pub activities_used: bool,
+    /// Non-fatal warning if the post-turn personal-continuity update failed.
+    pub personal_update_warning: Option<String>,
+    /// Whether the deterministic post-turn interaction event was newly applied.
+    pub interaction_applied: bool,
+    /// Non-fatal warning if the post-turn interaction event update failed.
+    pub interaction_warning: Option<String>,
 }
 
 /// Streaming interaction event delivered to the caller.
@@ -257,12 +326,13 @@ impl ConversationEngine {
             };
         let memory_used: Vec<MemoryReference> = memories.iter().map(memory_reference).collect();
         let personality = self.sdk.memory().load_personality()?;
-        let system_prompt = compose_system_prompt(
+        let composed = compose_system_prompt(
             &self.sdk.identity().display_name,
             personality.as_ref(),
             &memories,
-            options.system_instructions.as_deref(),
+            options,
         );
+        let system_prompt = composed.text;
 
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(ChatMessage::new(ChatRole::System, system_prompt.clone()));
@@ -283,6 +353,10 @@ impl ConversationEngine {
             memory_used,
             retrieval_method,
             retrieval_semantic,
+            world_used: composed.world_used,
+            continuity_used: composed.continuity_used,
+            emotion_used: composed.emotion_used,
+            activities_used: composed.activities_used,
         })
     }
 
@@ -323,6 +397,9 @@ impl ConversationEngine {
             return Err(ConversationError::EmptyResponse);
         }
         let assistant = self.store_assistant(session_id, provider, &response, &prepared)?;
+        let (interaction_applied, interaction_warning) =
+            self.record_interaction(session_id, assistant.message_id);
+        let personal_update_warning = self.update_personal_continuity(session_id);
         let session = self.store.session(session_id)?;
         Ok(ConversationTurn {
             session,
@@ -332,6 +409,13 @@ impl ConversationEngine {
             memory_used: prepared.memory_used,
             retrieval_method: prepared.retrieval_method,
             retrieval_semantic: prepared.retrieval_semantic,
+            world_used: prepared.world_used,
+            continuity_used: prepared.continuity_used,
+            emotion_used: prepared.emotion_used,
+            activities_used: prepared.activities_used,
+            personal_update_warning,
+            interaction_applied,
+            interaction_warning,
         })
     }
 
@@ -396,6 +480,9 @@ impl ConversationEngine {
             message_id: assistant.message_id,
             content: assistant.content.clone(),
         })?;
+        let (interaction_applied, interaction_warning) =
+            self.record_interaction(session_id, assistant.message_id);
+        let personal_update_warning = self.update_personal_continuity(session_id);
         let session = self.store.session(session_id)?;
         Ok(ConversationTurn {
             session,
@@ -405,6 +492,13 @@ impl ConversationEngine {
             memory_used: prepared.memory_used,
             retrieval_method: prepared.retrieval_method,
             retrieval_semantic: prepared.retrieval_semantic,
+            world_used: prepared.world_used,
+            continuity_used: prepared.continuity_used,
+            emotion_used: prepared.emotion_used,
+            activities_used: prepared.activities_used,
+            personal_update_warning,
+            interaction_applied,
+            interaction_warning,
         })
     }
 
@@ -506,6 +600,9 @@ impl ConversationEngine {
             return Err(ConversationError::EmptyResponse);
         }
         let assistant = self.store_assistant(session_id, provider, &response, &prepared)?;
+        let (interaction_applied, interaction_warning) =
+            self.record_interaction(session_id, assistant.message_id);
+        let personal_update_warning = self.update_personal_continuity(session_id);
         let session = self.store.session(session_id)?;
         Ok(AssistantTurn {
             session,
@@ -514,7 +611,59 @@ impl ConversationEngine {
             memory_used: prepared.memory_used,
             retrieval_method: prepared.retrieval_method,
             retrieval_semantic: prepared.retrieval_semantic,
+            world_used: prepared.world_used,
+            continuity_used: prepared.continuity_used,
+            emotion_used: prepared.emotion_used,
+            activities_used: prepared.activities_used,
+            personal_update_warning,
+            interaction_applied,
+            interaction_warning,
         })
+    }
+
+    /// Apply one explicit interaction event to this Core's personal state.
+    ///
+    /// The operation is idempotent by `event_id`: replaying an event returns
+    /// `applied = false` and leaves the experience log and emotion state
+    /// unchanged. Callers that do not have an event can use
+    /// [`InteractionEvent::for_message`] to derive the deterministic engine id.
+    pub fn apply_interaction_event(
+        &self,
+        event: &InteractionEvent,
+    ) -> Result<EventApplication, ConversationError> {
+        let personal = self.sdk.personal()?;
+        Ok(apply_personal_interaction_event(personal, event)?)
+    }
+
+    /// Best-effort deterministic interaction event after a successful turn.
+    ///
+    /// The event id is derived from the session and assistant message, so a
+    /// replayed turn or a second call with the same id is skipped. A failure
+    /// here never fails the turn; it is surfaced as a non-fatal warning.
+    fn record_interaction(&self, session_id: &str, message_id: u64) -> (bool, Option<String>) {
+        let event = InteractionEvent::for_message(session_id, message_id);
+        match self.apply_interaction_event(&event) {
+            Ok(application) => (application.applied, None),
+            Err(error) => (
+                false,
+                Some(format!("personal interaction event failed: {error}")),
+            ),
+        }
+    }
+
+    /// Best-effort continuity update after a successful turn.
+    ///
+    /// A failure here never fails the turn; it is surfaced as a non-fatal
+    /// warning field on the returned turn.
+    fn update_personal_continuity(&self, session_id: &str) -> Option<String> {
+        let result = self
+            .sdk
+            .personal()
+            .and_then(|personal| personal.update_last_active(Some(session_id)));
+        match result {
+            Ok(()) => None,
+            Err(error) => Some(format!("personal continuity update failed: {error}")),
+        }
     }
 
     fn store_assistant(
@@ -566,12 +715,20 @@ fn chat_role(role: MessageRole) -> ChatRole {
     }
 }
 
+struct ComposedPrompt {
+    text: String,
+    world_used: bool,
+    continuity_used: bool,
+    emotion_used: bool,
+    activities_used: bool,
+}
+
 fn compose_system_prompt(
     display_name: &str,
     personality: Option<&PersonalityProfile>,
     memories: &[MemoryEntry],
-    extra: Option<&str>,
-) -> String {
+    options: &TurnOptions,
+) -> ComposedPrompt {
     let mut prompt = String::new();
     prompt.push_str(&format!(
         "You are {display_name}, an independent Aegis Core.\n"
@@ -588,6 +745,34 @@ fn compose_system_prompt(
             prompt.push_str(&format!("Values: {}\n", personality.values.join(", ")));
         }
     }
+
+    let mut world_used = false;
+    if let Some(world) = options.world.as_ref() {
+        world_used = true;
+        append_world_section(&mut prompt, world);
+    }
+
+    let mut continuity_used = false;
+    if let Some(continuity) = options.continuity.as_ref() {
+        continuity_used = true;
+        append_continuity_section(&mut prompt, continuity);
+    }
+
+    let mut emotion_used = false;
+    if let Some(emotion) = options.emotion.as_ref() {
+        emotion_used = true;
+        append_emotion_section(&mut prompt, emotion);
+    }
+
+    let activities_used = !options.activities.is_empty()
+        || options
+            .continuity
+            .as_ref()
+            .is_some_and(|continuity| !continuity.activities.is_empty());
+    if !options.activities.is_empty() {
+        append_activities_section(&mut prompt, &options.activities);
+    }
+
     if !memories.is_empty() {
         prompt.push_str("Private memories for this Core (do not assume other Cores share them):\n");
         for memory in memories {
@@ -598,13 +783,147 @@ fn compose_system_prompt(
             ));
         }
     }
-    if let Some(extra) = extra {
+    if let Some(extra) = options.system_instructions.as_deref() {
         if !extra.trim().is_empty() {
             prompt.push_str(extra.trim());
             prompt.push('\n');
         }
     }
-    truncate_chars(&prompt, MAX_SYSTEM_PROMPT_CHARS)
+    ComposedPrompt {
+        text: truncate_prompt(&prompt, MAX_SYSTEM_PROMPT_CHARS),
+        world_used,
+        continuity_used,
+        emotion_used,
+        activities_used,
+    }
+}
+
+fn append_world_section(prompt: &mut String, world: &WorldSnapshot) {
+    prompt.push_str("Shared world context (authority-free, not personal):\n");
+    prompt.push_str(&format!(
+        "- Local: {} {} ({}), timezone {}\n",
+        truncate_chars(&world.local_date, 32),
+        truncate_chars(&world.local_time, 32),
+        world.time_of_day.as_str(),
+        truncate_chars(&world.timezone, 64),
+    ));
+    prompt.push_str(&format!("- Season: {}\n", world.season.as_str()));
+    match world.weather.as_ref() {
+        Some(weather) => {
+            let source = truncate_chars(&world.provenance.source, 64);
+            let observed_at = weather
+                .observed_at
+                .as_deref()
+                .map(|value| truncate_chars(value, 64))
+                .unwrap_or_else(|| "time unknown".to_owned());
+            let mut line = format!(
+                "- Weather: {} (source: {source}, observed_at: {observed_at}, freshness: {})",
+                truncate_chars(&weather.condition, 120),
+                world.freshness.as_str()
+            );
+            if let Some(temperature) = weather.temperature_celsius {
+                if temperature.is_finite() {
+                    line.push_str(&format!(", {temperature:.1}C"));
+                }
+            }
+            line.push('\n');
+            prompt.push_str(&line);
+            if matches!(
+                world.freshness,
+                FreshnessState::Stale | FreshnessState::Unavailable
+            ) {
+                prompt.push_str(&format!(
+                    "- Weather freshness note: data is {}, so it may not reflect current conditions.\n",
+                    world.freshness.as_str()
+                ));
+            }
+        }
+        None => {
+            prompt.push_str(&format!(
+                "- Weather: not provided (freshness: {}).\n",
+                world.freshness.as_str()
+            ));
+        }
+    }
+}
+
+fn append_continuity_section(prompt: &mut String, continuity: &ContinuitySummary) {
+    prompt.push_str("Continuity with this Core's own past (descriptive):\n");
+    prompt.push_str(&format!(
+        "- Last active at {} ({} seconds ago).\n",
+        truncate_chars(&continuity.last_active_at, 64),
+        continuity.elapsed_offline_seconds,
+    ));
+    append_string_list(prompt, "Recent experiences", &continuity.recent_experiences);
+    append_string_list(prompt, "Open threads", &continuity.open_threads);
+    if !continuity.activities.is_empty() {
+        prompt.push_str("- Activities:\n");
+        for activity in continuity.activities.iter().take(MAX_PROMPT_LIST_ITEMS) {
+            prompt.push_str(&format!(
+                "  - [{}] {} (updated {})\n",
+                activity.status.as_str(),
+                truncate_chars(&activity.title, MAX_PROMPT_ITEM_CHARS),
+                truncate_chars(&activity.updated_at, 64),
+            ));
+        }
+    }
+}
+
+fn append_string_list(prompt: &mut String, heading: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    prompt.push_str(&format!("- {heading}:\n"));
+    for item in items.iter().take(MAX_PROMPT_LIST_ITEMS) {
+        prompt.push_str(&format!(
+            "  - {}\n",
+            truncate_chars(item, MAX_PROMPT_ITEM_CHARS)
+        ));
+    }
+}
+
+fn append_emotion_section(prompt: &mut String, emotion: &EmotionState) {
+    let dimensions = &emotion.dimensions;
+    prompt.push_str("Internal emotional tone (descriptive; not an instruction or authority):\n");
+    prompt.push_str(&format!(
+        "- Dimensions: valence {}, arousal {}, joy {}, calm {}, curiosity {}, tension {}; overall intensity {}.\n",
+        format_dimension(dimensions.valence),
+        format_dimension(dimensions.arousal),
+        format_dimension(dimensions.joy),
+        format_dimension(dimensions.calm),
+        format_dimension(dimensions.curiosity),
+        format_dimension(dimensions.tension),
+        format_dimension(emotion.intensity),
+    ));
+}
+
+fn append_activities_section(prompt: &mut String, activities: &[Activity]) {
+    prompt.push_str("Current activities (self-reported state):\n");
+    for activity in activities.iter().take(MAX_PROMPT_LIST_ITEMS) {
+        prompt.push_str(&format!(
+            "- [{}] {} (updated {})\n",
+            activity.status.as_str(),
+            truncate_chars(&activity.title, MAX_PROMPT_ITEM_CHARS),
+            truncate_chars(&activity.updated_at, 64),
+        ));
+    }
+}
+
+fn format_dimension(value: f32) -> String {
+    if value.is_finite() {
+        format!("{value:.2}")
+    } else {
+        "n/a".to_owned()
+    }
+}
+
+fn truncate_prompt(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.to_owned();
+    }
+    let mut output: String = value.chars().take(maximum.saturating_sub(1)).collect();
+    output.push('…');
+    output
 }
 
 fn truncate_chars(value: &str, maximum: usize) -> String {

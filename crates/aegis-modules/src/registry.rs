@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::manifest::{
-    is_reserved_module_id, is_sha256, validate_module_id, version_satisfies, ManifestError,
-    ModuleManifest, MODULE_MANIFEST_SCHEMA,
+    is_reserved_module_id, is_sha256, validate_module_id, ManifestError, ModuleManifest,
+    MODULE_MANIFEST_SCHEMA,
 };
 
 pub const MODULE_REGISTRY_SCHEMA: &str = "aegis.module.registry.v1";
@@ -167,6 +167,11 @@ pub enum ModuleError {
         requirement: String,
         actual: String,
     },
+    #[error("module {module_id} is required by enabled module {dependent}")]
+    DependencyInUse {
+        module_id: String,
+        dependent: String,
+    },
     #[error("module is not registered: {0}")]
     ModuleNotFound(String),
     #[error("module {module_id} has no declared permission requests")]
@@ -289,44 +294,41 @@ impl ModuleRegistry {
         Ok(record)
     }
 
-    /// Enables a module only after its declared permission requests and
-    /// manifest integrity are checked. No data access is granted.
+    /// Read-only enable precondition check.
+    ///
+    /// Verifies module existence, lifecycle transition legality, declared
+    /// permissions, stored manifest integrity, and dependency availability and
+    /// version compatibility. It never mutates the registry, so callers (UI,
+    /// CLI, automation) can preview whether [`Self::enable`] will succeed.
+    pub fn check_enable(&self, module_id: &str) -> Result<(), ModuleError> {
+        validate_module_id(module_id)?;
+        let connection = self.open()?;
+        check_enable_preconditions(&connection, module_id)
+    }
+
+    /// Read-only disable precondition check.
+    ///
+    /// Verifies module existence, lifecycle transition legality, and that no
+    /// currently enabled module depends on this one. It never mutates the
+    /// registry.
+    pub fn check_disable(&self, module_id: &str) -> Result<(), ModuleError> {
+        validate_module_id(module_id)?;
+        let connection = self.open()?;
+        check_disable_preconditions(&connection, module_id)
+    }
+
+    /// Enables a module only after its declared permission requests, manifest
+    /// integrity, and dependency compatibility are checked. No data access is
+    /// granted.
     pub fn enable(&self, module_id: &str) -> Result<ModuleRecord, ModuleError> {
         validate_module_id(module_id)?;
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
 
-        let (record, manifest_json) = read_record_and_manifest(&transaction, module_id)?
+        check_enable_preconditions(&transaction, module_id)?;
+        let record = read_record(&transaction, module_id)?
             .ok_or_else(|| ModuleError::ModuleNotFound(module_id.to_owned()))?;
-        if record.permissions.is_empty() {
-            return Err(ModuleError::NoDeclaredPermissions {
-                module_id: module_id.to_owned(),
-            });
-        }
-
-        let manifest: ModuleManifest = serde_json::from_str(&manifest_json)?;
-        manifest.validate_structure()?;
-        let actual = manifest.computed_digest()?;
-        if manifest.integrity.digest != actual || actual != record.manifest_sha256 {
-            return Err(ModuleError::ExpectedDigestMismatch {
-                expected: record.manifest_sha256,
-                actual,
-            });
-        }
-        ensure_dependencies_available(&transaction, &manifest)?;
-
         let from = record.lifecycle_state;
-        if !matches!(
-            from,
-            ModuleLifecycleState::Installed
-                | ModuleLifecycleState::Disabled
-                | ModuleLifecycleState::Failed
-        ) {
-            return Err(ModuleError::IllegalTransition {
-                from: from.as_str().to_owned(),
-                to: ModuleLifecycleState::Enabled.as_str().to_owned(),
-            });
-        }
 
         let timestamp = now_rfc3339()?;
         transaction.execute(
@@ -350,17 +352,41 @@ impl ModuleRegistry {
     }
 
     /// Marks a module disabled without touching its manifest or data.
+    ///
+    /// Refused while another module is enabled and declares a dependency on
+    /// this one, so an enabled dependent never loses a required provider.
     pub fn disable(&self, module_id: &str) -> Result<ModuleRecord, ModuleError> {
-        self.transition(
-            module_id,
-            &[
-                ModuleLifecycleState::Installed,
-                ModuleLifecycleState::Enabled,
+        validate_module_id(module_id)?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction()?;
+        check_disable_preconditions(&transaction, module_id)?;
+        let record = read_record(&transaction, module_id)?
+            .ok_or_else(|| ModuleError::ModuleNotFound(module_id.to_owned()))?;
+        let from = record.lifecycle_state;
+
+        let timestamp = now_rfc3339()?;
+        transaction.execute(
+            "UPDATE aegis_modules SET lifecycle_state = ?1, updated_at = ?2 WHERE module_id = ?3",
+            params![
+                ModuleLifecycleState::Disabled.as_str(),
+                timestamp,
+                module_id
             ],
-            ModuleLifecycleState::Disabled,
+        )?;
+        insert_event(
+            &transaction,
+            module_id,
             "disable",
+            Some(from),
+            ModuleLifecycleState::Disabled,
             "disabled while preserving data",
-        )
+            &timestamp,
+        )?;
+
+        let updated = read_record(&transaction, module_id)?
+            .ok_or_else(|| ModuleError::ModuleNotFound(module_id.to_owned()))?;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     /// Marks a module uninstalled without deleting its manifest, events, or
@@ -616,6 +642,89 @@ fn ensure_tables(connection: &Connection) -> Result<(), ModuleError> {
     Ok(())
 }
 
+fn check_enable_preconditions(connection: &Connection, module_id: &str) -> Result<(), ModuleError> {
+    let (record, manifest_json) = read_record_and_manifest(connection, module_id)?
+        .ok_or_else(|| ModuleError::ModuleNotFound(module_id.to_owned()))?;
+    let from = record.lifecycle_state;
+    if !matches!(
+        from,
+        ModuleLifecycleState::Installed
+            | ModuleLifecycleState::Disabled
+            | ModuleLifecycleState::Failed
+    ) {
+        return Err(ModuleError::IllegalTransition {
+            from: from.as_str().to_owned(),
+            to: ModuleLifecycleState::Enabled.as_str().to_owned(),
+        });
+    }
+    if record.permissions.is_empty() {
+        return Err(ModuleError::NoDeclaredPermissions {
+            module_id: module_id.to_owned(),
+        });
+    }
+
+    let manifest: ModuleManifest = serde_json::from_str(&manifest_json)?;
+    manifest.validate_structure()?;
+    let actual = manifest.computed_digest()?;
+    if manifest.integrity.digest != actual || actual != record.manifest_sha256 {
+        return Err(ModuleError::ExpectedDigestMismatch {
+            expected: record.manifest_sha256,
+            actual,
+        });
+    }
+    ensure_dependencies_available(connection, &manifest)
+}
+
+fn check_disable_preconditions(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<(), ModuleError> {
+    let record = read_record(connection, module_id)?
+        .ok_or_else(|| ModuleError::ModuleNotFound(module_id.to_owned()))?;
+    let from = record.lifecycle_state;
+    if !matches!(
+        from,
+        ModuleLifecycleState::Installed | ModuleLifecycleState::Enabled
+    ) {
+        return Err(ModuleError::IllegalTransition {
+            from: from.as_str().to_owned(),
+            to: ModuleLifecycleState::Disabled.as_str().to_owned(),
+        });
+    }
+    if let Some(dependent) = first_enabled_dependent(connection, module_id)? {
+        return Err(ModuleError::DependencyInUse {
+            module_id: module_id.to_owned(),
+            dependent,
+        });
+    }
+    Ok(())
+}
+
+/// First currently enabled module that declares `module_id` as a dependency.
+fn first_enabled_dependent(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<Option<String>, ModuleError> {
+    let mut statement = connection.prepare(
+        "SELECT module_id, manifest_json FROM aegis_modules
+         WHERE lifecycle_state = ?1 AND module_id <> ?2 ORDER BY module_id ASC",
+    )?;
+    let mut rows = statement.query(params![ModuleLifecycleState::Enabled.as_str(), module_id])?;
+    while let Some(row) = rows.next()? {
+        let candidate_id: String = row.get(0)?;
+        let manifest_json: String = row.get(1)?;
+        let manifest: ModuleManifest = serde_json::from_str(&manifest_json)?;
+        if manifest
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.module_id == module_id)
+        {
+            return Ok(Some(candidate_id));
+        }
+    }
+    Ok(None)
+}
+
 fn ensure_dependencies_available(
     connection: &Connection,
     manifest: &ModuleManifest,
@@ -644,16 +753,16 @@ fn ensure_dependencies_available(
                         state: raw,
                     });
                 }
-                if let Some(requirement) = &dependency.version_requirement {
+                if dependency.has_version_constraint() {
                     let actual: String = connection.query_row(
                         "SELECT version FROM aegis_modules WHERE module_id = ?1",
                         [dependency.module_id.as_str()],
                         |row| row.get(0),
                     )?;
-                    if !version_satisfies(requirement, &actual) {
+                    if !dependency.version_matches(&actual) {
                         return Err(ModuleError::DependencyVersionMismatch {
                             module_id: dependency.module_id.clone(),
-                            requirement: requirement.clone(),
+                            requirement: dependency.version_expectation(),
                             actual,
                         });
                     }

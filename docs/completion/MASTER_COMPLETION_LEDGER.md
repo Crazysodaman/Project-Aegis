@@ -112,3 +112,55 @@ Evidence is local Windows development only. HT/LV/OA are not claimed. A-04, B-01
 6. Live Ollama verification with a real model.
 7. TUI interaction tests and native GUI decision.
 8. Independent Agent 5 acceptance audit of the current tree.
+
+## Batch 3 (2026-11-26)
+
+- Baseline preserved at commit `2bd2513` (354 tests). Post-batch: **371 passed, 0 failed**; fmt/clippy/build pass.
+- GPU yield extended and live-verified for gaming-signal detection, cooperative unload, VRAM recovery (6,915 MB reclaimed), deferred resumption, failure handling, hysteresis, and telemetry-unavailable safety. **Live in-game yield not performed; gaming-safe not claimed.**
+- Remote Fleet identity (HMAC challenge-response) implemented; separate-process LAN handshake verified; LAN probe/route/remote-inference/interruption/recovery verified. **Real Artemis authenticated inference not claimed** (no endpoint/agent).
+- Cores #1/#2/#3/#6 installed and verified; profiles applied; private-memory isolation, lifecycle, and multi-Core startup verified; #4 prohibited, #7 blank; legacy Sofía repo preserved.
+- Live resilience verified: cancellation under load, provider failure, service restart, conversation persistence.
+- Remaining not implemented: voice/STT/TTS, avatar rendering, OS service registration, Linux runtime, cross-host Artifact Library, native GUI. Not claimed.
+- QA: separate-process signals green; independent QA not claimed. Production: NO-GO. Continued lab development: GO.
+
+## Batch 4 (2026-11-26)
+
+- Recovery: baseline `2bd2513` intact; 11 modified + untracked source/docs; patch bundle `.tmp/b4-recovery/`; no commit; secrets clean; legacy Sofía repo untouched.
+- Real-game GPU yield live-verified with Phasmophobia (PID 7928): 6,583 MB reclaimed, game remained responsive, deferred work resumed after close, no oscillation; telemetry-unavailable fails closed. No FPS telemetry; in-game gameplay not run; gaming-safe not claimed.
+- Artemis (192.168.1.55): WinRM/RDP/SMB reachable, no Ollama/agent; **deployment BLOCKED pending owner authorization**; excluded from inference placement. Auth-failure, timeout, interruption, stale-heartbeat, isolation verified.
+- Cores #1/#2/#3/#6 preserved and verified; multi-Core + isolation + upgrade no-op verified.
+- Gates: fmt/clippy/build pass; **371 passed, 0 failed**.
+- **Production NO-GO; independent acceptance NOT AVAILABLE.**
+
+## Batch 5 (2026-11-26)
+
+- 10 subagents executed; **481 passed, 0 failed**; fmt/clippy/build pass; no commit.
+- Fleet freshness/capabilities/perf harness added; **Artemis still blocked (owner auth)**.
+- GUI Core workspace + expanded TUI (explicit UNAVAILABLE for unlinked data); service specs (unexecuted); voice/avatar infrastructure (no live audio/pixels); artifact search/audit; social context + module audit; +15 Core tests.
+- **Production NO-GO; independent acceptance NOT AVAILABLE.**
+
+## Batch 6 (2026-11-26)
+
+- 10 agents; **614 passed, 0 failed**; fmt/clippy/build pass; no commit. Fixed timing-fragile module runtime test.
+- Live: Windows SAPI TTS (84,904 B WAV), BMP avatar pixels (61,494 B). **Artemis, gameplay, Debian runtime, native GUI, STT remain blocked/not implemented.**
+- **Production NO-GO; independent acceptance NOT AVAILABLE.**
+
+## Batch 7 (2026-11-26)
+
+- 10 agents; **718 passed, 0 failed**; fmt/clippy/build pass; no commit. Live TTS+file STT, avatar frames, inference-pressure, LAN artifact, HMAC re-check.
+- **P0 world/continuity audited only**; no implementation. Backup gap: per-Core memory/conversation/assets/social/embeddings not backed up.
+- Artemis/gameplay/Debian/native GUI/mic STT/sandbox/replication remain blocked or absent. **Production NO-GO; independent acceptance NOT AVAILABLE.**
+
+## Batch 8 (2026-11-26)
+
+- P0 World & Continuity M1–M7 implemented; **798 passed, 0 failed**; fmt/clippy/build pass; no commit.
+- Live: IANA world+weather (Open-Meteo), contextual chat, continuity across processes, backup/restore incl. personal.db.
+- New dep chrono-tz 0.10.0. Remaining: event?emotion wiring, IPC distribution, SAPI/UI, Artemis, independent external QA.
+- **Production NO-GO; independent acceptance NOT AVAILABLE.**
+
+## AEGIS-FINAL (2026-11-26)
+
+- 20 agents + Lead; **942 passed, 0 failed**; fmt/clippy/build pass; no commit.
+- Closed event?emotion, voice style, avatar sequences, wardrobe constraints, GUI/TUI world/personal, .corepkg, social events, module version checks, live-safe backup, installer preflight.
+- Live TTS/STT, avatar, weather, continuity, backup/restore; Artemis/Debian/native GUI/mic/GPU renderer/owner/external QA remain blocked.
+- **Development GO; Deployment NO-GO; Production NO-GO; independent acceptance NOT SATISFIED.**

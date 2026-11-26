@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::policy::{ExecutionPolicy, ModuleTrust, PolicyError};
 use crate::registry::{ModuleError, ModuleLifecycleState, ModuleRegistry};
 use crate::runtime::resolve_entrypoint;
 
@@ -46,6 +47,16 @@ pub enum ModuleToolError {
     InputTooLarge,
     #[error("module tool output is too large")]
     OutputTooLarge,
+    #[error("module execution policy is invalid: {0}")]
+    Policy(#[from] PolicyError),
+    #[error("module {module_id} is restricted; an explicit allow_restricted policy is required")]
+    RestrictedDenied { module_id: String },
+    #[error("module {module_id} declares {declared} tools but the policy allows {allowed}")]
+    ToolCountExceeded {
+        module_id: String,
+        declared: usize,
+        allowed: usize,
+    },
     #[error("module entrypoint is unavailable: {0}")]
     Entrypoint(String),
     #[error("module tool {tool} failed to spawn: {message}")]
@@ -61,6 +72,9 @@ pub enum ModuleToolError {
 }
 
 /// Run one module-declared tool through its package entrypoint.
+///
+/// Uses the default `trusted_local` [`ExecutionPolicy`]. Call
+/// [`run_module_tool_with_policy`] to apply a tighter or restricted policy.
 pub fn run_module_tool(
     root: &Path,
     module_id: &str,
@@ -69,12 +83,52 @@ pub fn run_module_tool(
     arguments: &Value,
     timeout: Duration,
 ) -> Result<Value, ModuleToolError> {
+    run_module_tool_with_policy(
+        root,
+        module_id,
+        tool_name,
+        caller_core_uuid,
+        arguments,
+        timeout,
+        &ExecutionPolicy::default(),
+    )
+}
+
+/// Run one module-declared tool under an explicit trust/limits policy.
+///
+/// The policy is validated first. A `restricted` module is denied unless the
+/// policy sets `allow_restricted`. Input, output, and timeout are bounded by the
+/// policy (and never above the framework hard caps). Declared-tool count is
+/// checked against the manifest before spawning.
+#[allow(clippy::too_many_arguments)]
+pub fn run_module_tool_with_policy(
+    root: &Path,
+    module_id: &str,
+    tool_name: &str,
+    caller_core_uuid: &str,
+    arguments: &Value,
+    timeout: Duration,
+    policy: &ExecutionPolicy,
+) -> Result<Value, ModuleToolError> {
+    policy.validate()?;
+    if policy.trust == ModuleTrust::Restricted && !policy.allow_restricted {
+        return Err(ModuleToolError::RestrictedDenied {
+            module_id: module_id.to_owned(),
+        });
+    }
     let registry = ModuleRegistry::new(aegis_storage::StoragePaths::new(root)?);
     let inspection = registry.inspect(module_id)?;
     if inspection.record.lifecycle_state != ModuleLifecycleState::Enabled {
         return Err(ModuleToolError::NotEnabled {
             module_id: module_id.to_owned(),
             state: inspection.record.lifecycle_state.as_str().to_owned(),
+        });
+    }
+    if inspection.manifest.tools.len() > policy.max_tool_count {
+        return Err(ModuleToolError::ToolCountExceeded {
+            module_id: module_id.to_owned(),
+            declared: inspection.manifest.tools.len(),
+            allowed: policy.max_tool_count,
         });
     }
     let tool = inspection
@@ -97,7 +151,7 @@ pub fn run_module_tool(
         "arguments": arguments,
     });
     let input_bytes = serde_json::to_vec(&input)?;
-    if input_bytes.len() > MAX_TOOL_INPUT_BYTES {
+    if input_bytes.len() > policy.effective_input_bytes() {
         return Err(ModuleToolError::InputTooLarge);
     }
 
@@ -120,7 +174,8 @@ pub fn run_module_tool(
         caller_core_uuid,
         &input_path,
         &output_path,
-        timeout,
+        policy.effective_runtime(timeout),
+        policy.effective_output_bytes(),
     );
     let _ = fs::remove_dir_all(&run_root);
     result
@@ -136,6 +191,7 @@ fn execute(
     input_path: &Path,
     output_path: &Path,
     timeout: Duration,
+    max_output_bytes: usize,
 ) -> Result<Value, ModuleToolError> {
     let mut command = Command::new(executable);
     command
@@ -171,7 +227,9 @@ fn execute(
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                if let Some(reported) = read_reported_failure(output_path, tool_name)? {
+                if let Some(reported) =
+                    read_reported_failure(output_path, tool_name, max_output_bytes)?
+                {
                     return Err(reported);
                 }
                 return Err(ModuleToolError::Failed {
@@ -208,7 +266,7 @@ fn execute(
             detail: "output is not a regular file".to_owned(),
         });
     }
-    if metadata.len() > MAX_TOOL_OUTPUT_BYTES as u64 {
+    if metadata.len() > max_output_bytes as u64 {
         return Err(ModuleToolError::OutputTooLarge);
     }
     let bytes = fs::read(output_path)?;
@@ -241,11 +299,12 @@ fn execute(
 fn read_reported_failure(
     output_path: &Path,
     tool_name: &str,
+    max_output_bytes: usize,
 ) -> Result<Option<ModuleToolError>, ModuleToolError> {
     let Ok(bytes) = fs::read(output_path) else {
         return Ok(None);
     };
-    if bytes.len() > MAX_TOOL_OUTPUT_BYTES {
+    if bytes.len() > max_output_bytes {
         return Ok(Some(ModuleToolError::OutputTooLarge));
     }
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {

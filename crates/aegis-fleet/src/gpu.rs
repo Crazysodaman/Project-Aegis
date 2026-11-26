@@ -203,9 +203,28 @@ pub struct AdmissionDecision {
 
 /// Fail-closed admission decision for background GPU inference.
 pub fn evaluate_admission(policy: &GpuPolicy, telemetry: &GpuTelemetry) -> AdmissionDecision {
+    evaluate_admission_with_gaming(policy, telemetry, None)
+}
+
+/// Admission decision that also honours an explicit gaming-workload signal.
+///
+/// A detected gaming process denies background inference when `gaming_yield`
+/// is enabled, even if GPU utilization is momentarily low (menu, loading, or
+/// paused game). An unavailable gaming probe is *not* by itself a denial
+/// reason: the GPU telemetry path already fails closed when it is missing.
+pub fn evaluate_admission_with_gaming(
+    policy: &GpuPolicy,
+    telemetry: &GpuTelemetry,
+    gaming: Option<&crate::gaming::GamingSignal>,
+) -> AdmissionDecision {
     let mut reasons = Vec::new();
     if !telemetry.available {
         reasons.push("gpu_telemetry_unavailable".to_owned());
+    }
+    if let Some(gaming) = gaming {
+        if policy.gaming_yield && gaming.detected {
+            reasons.push("gaming_detected".to_owned());
+        }
     }
     let utilization = telemetry.utilization_percent;
     let free_vram = telemetry.free_vram_mb();

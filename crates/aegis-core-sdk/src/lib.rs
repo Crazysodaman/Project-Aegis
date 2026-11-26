@@ -9,12 +9,19 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod events;
 pub mod memory;
+pub mod personal;
 pub mod personality;
 
 pub use capability::{
     CapabilityManifest, CoreCapability, ALL_CAPABILITIES, CAPABILITY_MANIFEST_SCHEMA,
     REQUIRED_CAPABILITIES,
+};
+pub use events::{
+    apply_interaction_event, apply_interaction_event_at, interaction_influence, EventApplication,
+    InteractionEvent, EVENT_LEDGER_TABLE, INTERACTION_DELTA, INTERACTION_INFLUENCE_SOURCE,
+    INTERACTION_INFLUENCE_WEIGHT, MAX_EVENT_ID_CHARS,
 };
 pub use memory::{
     CoreMemoryStore, ImportMode, ImportOutcome, MemoryEntry, MemoryEvent, MemoryExport, MemoryKind,
@@ -23,6 +30,18 @@ pub use memory::{
     MAX_QUERY_TEXT_CHARS, MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS, MEMORY_ENTRIES_TABLE,
     MEMORY_EVENTS_TABLE, MEMORY_EVENT_SCHEMA, MEMORY_EXPORT_SCHEMA, MEMORY_OWNERSHIP_TABLE,
     PERSONALITY_GROWTH_TABLE, PERSONALITY_TABLE,
+};
+pub use personal::{
+    Activity, ActivityStatus, ContinuitySummary, EmotionDelta, EmotionDimensions,
+    EmotionHistoryEntry, EmotionInfluence, EmotionState, OpenThread, OutfitDecisionRecord,
+    PersonalStore, Routine, ACTIVITIES_TABLE, CONTINUITY_SUMMARY_SCHEMA, CONTINUITY_TABLE,
+    EMOTION_DECAY_HALF_LIFE_SECONDS, EMOTION_HISTORY_TABLE, EMOTION_STATE_SCHEMA,
+    EMOTION_STATE_TABLE, MAX_ACTIVITY_LIST, MAX_ELAPSED_OFFLINE_SECONDS, MAX_EMOTION_HISTORY_LIMIT,
+    MAX_EMOTION_INFLUENCES, MAX_EXPERIENCE_CHARS, MAX_OPEN_THREADS, MAX_OPEN_THREAD_CHARS,
+    MAX_OPEN_THREAD_LIST, MAX_OUTFIT_LIST, MAX_RECENT_EXPERIENCES, MAX_ROUTINE_LIST,
+    MAX_SESSION_ID_CHARS, OPEN_THREADS_TABLE, OUTFIT_DECISIONS_TABLE, PERSONAL_APPLICATION_ID,
+    PERSONAL_COMPONENT, PERSONAL_DB_FILE, PERSONAL_EVENTS_TABLE, PERSONAL_OWNERSHIP_TABLE,
+    PERSONAL_SCHEMA, PERSONAL_SCHEMA_REVISION, PERSONAL_SCHEMA_TABLE, ROUTINES_TABLE,
 };
 pub use personality::{
     PersonalityProfile, MAX_GROWTH_POLICY_CHARS, MAX_TONE_CHARS, MAX_TRAITS, MAX_TRAIT_NAME_CHARS,
@@ -158,6 +177,7 @@ pub struct CoreSdkContext {
     pub identity: CoreIdentity,
     pub capabilities: CapabilityManifest,
     pub memory: CoreMemoryStore,
+    pub personal: PersonalStore,
     pub personality: Option<PersonalityProfile>,
 }
 
@@ -175,12 +195,14 @@ impl CoreSdkContext {
             return Err(SdkError::OwnershipMismatch);
         }
         let memory = CoreMemoryStore::open(root, &core_uuid)?;
+        let personal = PersonalStore::open(root, &core_uuid)?;
         let capabilities = CapabilityManifest::full(&core_uuid)?;
         let personality = memory.load_personality()?;
         Ok(Self {
             identity: snapshot.identity,
             capabilities,
             memory,
+            personal,
             personality,
         })
     }
@@ -198,6 +220,11 @@ impl CoreSdkContext {
     /// Borrow the memory store.
     pub fn memory(&self) -> &CoreMemoryStore {
         &self.memory
+    }
+
+    /// Borrow the personal-state store bound to the same Core identity.
+    pub fn personal(&self) -> Result<&PersonalStore, SdkError> {
+        Ok(&self.personal)
     }
 
     /// Borrow the most recently loaded personality profile, if any.

@@ -27,9 +27,11 @@ pub use engine::{
 pub use error::ConversationError;
 pub use retrieval::{KeywordRetriever, MemoryRetriever, RetrievalOutcome};
 pub use store::{
-    ConversationArchive, ConversationExport, ConversationMessage, ConversationSession,
-    ConversationStore, MessageRole, NewMessage, SessionEvent, SessionState, ARCHIVE_SCHEMA,
-    CONVERSATION_APPLICATION_ID, CONVERSATION_COMPONENT, CONVERSATION_DB_FILE, EXPORT_SCHEMA,
+    ConsolidationOutcome, ConversationArchive, ConversationExport, ConversationMessage,
+    ConversationSession, ConversationStore, ImportantExperience, MessageRole, NewMessage,
+    SessionEvent, SessionState, SessionSummary, ARCHIVE_SCHEMA, CONSOLIDATION_PROVENANCE,
+    CONSOLIDATION_SOURCE_PREFIX, CONVERSATION_APPLICATION_ID, CONVERSATION_COMPONENT,
+    CONVERSATION_DB_FILE, EXPORT_SCHEMA, MAX_CONSOLIDATION_BATCH, MAX_CONSOLIDATION_CONTENT_CHARS,
     MAX_MESSAGES_PER_READ, MAX_MESSAGE_CHARS, MAX_METADATA_BYTES, MAX_SESSIONS_PER_ARCHIVE,
-    MAX_TITLE_CHARS, MESSAGE_SCHEMA, SESSION_EVENT_SCHEMA, SESSION_SCHEMA,
+    MAX_TITLE_CHARS, MESSAGE_SCHEMA, SESSION_EVENT_SCHEMA, SESSION_SCHEMA, SESSION_SUMMARY_SCHEMA,
 };

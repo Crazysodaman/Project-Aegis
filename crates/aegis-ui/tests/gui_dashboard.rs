@@ -443,3 +443,690 @@ fn terminal_dashboard_contains_real_ids_and_ansi_colors() {
     assert!(rendered.contains("STOP"));
     assert!(!rendered.contains(&fixture.owner_token));
 }
+
+#[test]
+fn core_workspace_renders_required_sections_with_real_backend_data() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let server = Server::start(fixture.path(), false);
+    let response = get(server.addr(), &format!("/core/{CORE_A}"));
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    for section in [
+        "Identity",
+        "Memory",
+        "Personality",
+        "Voice",
+        "Appearance",
+        "Modules",
+        "Permissions",
+        "Diagnostics",
+        "Activity",
+        "Fleet",
+        "GPU",
+        "Inference",
+        "Service",
+    ] {
+        assert!(response.body.contains(section), "missing section {section}");
+    }
+    assert!(response.body.contains(CORE_A));
+    assert!(response.body.contains("Core A"));
+    assert!(response.body.contains("installed"));
+    assert!(response.body.contains("verified"));
+    assert!(response.body.contains("UNAVAILABLE"));
+    assert!(!response.body.contains(&fixture.owner_token));
+    assert!(!response.body.contains(&server.token()));
+}
+
+#[test]
+fn unknown_core_workspace_returns_clear_html_error() {
+    let fixture = Fixture::new();
+    let server = Server::start(fixture.path(), false);
+    let missing = "22222222-2222-4222-8222-222222222222";
+    let response = get(server.addr(), &format!("/core/{missing}"));
+    assert_eq!(response.status, 404);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(response.body.contains("Core not found"));
+    assert!(response.body.contains("No registered Core"));
+
+    let invalid = get(server.addr(), "/core/not-a-uuid");
+    assert_eq!(invalid.status, 400);
+    assert_eq!(
+        invalid.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(invalid.body.contains("Invalid Core identifier"));
+    assert!(!invalid.body.contains("panic"));
+}
+
+#[test]
+fn core_workspace_escapes_user_controlled_text() {
+    let fixture = Fixture::new();
+    let display_name = "<script>alert(\"x\")</script>&";
+    fixture.add_core(CORE_A, 1, display_name);
+    let server = Server::start(fixture.path(), false);
+    let body = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    assert!(!body.contains("<script>alert"));
+    assert!(body.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;"));
+}
+
+#[test]
+fn core_workspace_applies_core_theme_palette() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let server = Server::start(fixture.path(), false);
+    let body = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    assert!(body.contains("--primary: #9400D3"));
+    assert!(body.contains("--accent: #00C2FF"));
+    assert!(body.contains("--tertiary: #39FF14"));
+    assert!(body.contains("class=\"core-theme\""));
+    assert!(body.contains("Appearance"));
+    assert!(body.contains("Per-Core theme data is UNAVAILABLE"));
+}
+
+#[test]
+fn core_workspace_reports_backend_failure_without_panic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_file = temp.path().join("not-a-directory");
+    std::fs::write(&root_file, b"x").expect("write root file");
+    let server = Server::start(&root_file, false);
+    let response = get(server.addr(), &format!("/core/{CORE_A}"));
+    assert_eq!(response.status, 503);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(response.body.contains("Core workspace unavailable"));
+    assert!(!response.body.contains("panic"));
+}
+
+#[test]
+fn core_workspace_json_api_matches_html_workspace() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let server = Server::start(fixture.path(), false);
+    let response = get(server.addr(), &format!("/api/core/{CORE_A}"));
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-type"), Some("application/json"));
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    assert!(!response.body.contains(&fixture.owner_token));
+    assert!(!response.body.contains(&server.token()));
+
+    let value = response.json();
+    assert_eq!(value["ok"].as_bool(), Some(true));
+    assert_eq!(value["schema"], "aegis.ui.core_workspace.v1");
+    assert_eq!(value["core_uuid"], CORE_A);
+    assert_eq!(value["core_number"].as_u64(), Some(1));
+    assert_eq!(value["display_name"], "Core A");
+    assert_eq!(value["lifecycle_state"], "installed");
+    assert!(value["generated_at"].is_string());
+
+    let sections = value["sections"].as_array().expect("sections array");
+    let titles: Vec<&str> = sections
+        .iter()
+        .filter_map(|section| section["title"].as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "Identity",
+            "Memory",
+            "Personality",
+            "Voice",
+            "Appearance",
+            "Modules",
+            "Permissions",
+            "Diagnostics",
+            "Activity",
+            "Fleet",
+            "GPU",
+            "Inference",
+            "Service",
+            "World",
+            "Personal",
+            "Emotion",
+            "Continuity",
+            "Outfit",
+        ]
+    );
+    let statuses: Vec<&str> = sections
+        .iter()
+        .filter_map(|section| section["status"].as_str())
+        .collect();
+    assert!(statuses.contains(&"available"));
+    assert!(statuses.contains(&"unavailable"));
+
+    let identity = sections
+        .iter()
+        .find(|section| section["title"] == "Identity")
+        .expect("identity section");
+    let rows = identity["rows"].as_array().expect("identity rows");
+    assert!(rows
+        .iter()
+        .any(|row| row["label"] == "Core UUID" && row["value"] == CORE_A));
+    assert!(rows
+        .iter()
+        .any(|row| row["label"] == "Display name" && row["value"] == "Core A"));
+    assert!(rows
+        .iter()
+        .any(|row| row["label"] == "Integrity status" && row["value"] == "verified"));
+
+    let html = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    for title in &titles {
+        assert!(html.contains(*title), "HTML missing section {title}");
+    }
+    assert!(html.contains(CORE_A));
+    assert!(html.contains("Core A"));
+    assert!(html.contains("installed"));
+}
+
+#[test]
+fn core_workspace_json_api_returns_typed_errors() {
+    let fixture = Fixture::new();
+    let server = Server::start(fixture.path(), false);
+    let missing = "22222222-2222-4222-8222-222222222222";
+
+    let not_found = get(server.addr(), &format!("/api/core/{missing}"));
+    assert_eq!(not_found.status, 404);
+    assert_eq!(not_found.header("content-type"), Some("application/json"));
+    let value = not_found.json();
+    assert_eq!(value["ok"].as_bool(), Some(false));
+    assert_eq!(value["error"], "core_not_found");
+    assert!(!value.to_string().contains("panic"));
+
+    let invalid = get(server.addr(), "/api/core/not-a-uuid");
+    assert_eq!(invalid.status, 400);
+    assert_eq!(invalid.json()["error"], "invalid_core_uuid");
+
+    let empty = get(server.addr(), "/api/core");
+    assert_eq!(empty.status, 400);
+    assert_eq!(empty.json()["error"], "invalid_core_uuid");
+
+    let trailing_missing = get(server.addr(), &format!("/api/core/{missing}/"));
+    assert_eq!(trailing_missing.status, 404);
+    assert_eq!(trailing_missing.json()["error"], "core_not_found");
+}
+
+#[test]
+fn core_workspace_json_api_reports_backend_failure_without_panic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_file = temp.path().join("not-a-directory");
+    std::fs::write(&root_file, b"x").expect("write root file");
+    let server = Server::start(&root_file, false);
+    let response = get(server.addr(), &format!("/api/core/{CORE_A}"));
+    assert_eq!(response.status, 503);
+    assert_eq!(response.header("content-type"), Some("application/json"));
+    let value = response.json();
+    assert_eq!(value["ok"].as_bool(), Some(false));
+    assert_eq!(value["error"], "core_workspace_unavailable");
+    assert!(value["detail"]
+        .as_str()
+        .is_some_and(|detail| !detail.is_empty()));
+    assert!(!response.body.contains("panic"));
+}
+
+#[test]
+fn core_workspace_has_breadcrumb_json_link_and_roster_workspace_links() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/").body;
+    assert!(root.contains("/core/"));
+    assert!(root.contains("encodeURIComponent"));
+    assert!(root.contains("href=\"/api/status\""));
+
+    let workspace = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    assert!(workspace.contains("class=\"crumbs\""));
+    assert!(workspace.contains("aria-label=\"Breadcrumb\""));
+    assert!(workspace.contains("href=\"/\""));
+    assert!(workspace.contains(&format!("href=\"/api/core/{CORE_A}\"")));
+    assert!(workspace.contains("href=\"/api/status\""));
+    assert!(workspace.contains("JSON API"));
+    assert!(workspace.contains("dashboard"));
+}
+
+#[test]
+fn core_workspace_paths_tolerate_trailing_slash() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let server = Server::start(fixture.path(), false);
+
+    let html = get(server.addr(), &format!("/core/{CORE_A}/"));
+    assert_eq!(html.status, 200);
+    assert!(html.body.contains("Identity"));
+
+    let json = get(server.addr(), &format!("/api/core/{CORE_A}/"));
+    assert_eq!(json.status, 200);
+    assert_eq!(json.json()["core_uuid"], CORE_A);
+}
+
+#[test]
+fn core_workspace_json_api_serializes_user_text_safely() {
+    let fixture = Fixture::new();
+    let display_name = "<script>alert(\"x\")</script>&";
+    fixture.add_core(CORE_A, 1, display_name);
+    let server = Server::start(fixture.path(), false);
+
+    let response = get(server.addr(), &format!("/api/core/{CORE_A}"));
+    assert_eq!(response.status, 200);
+    let value = response.json();
+    assert_eq!(value["display_name"].as_str(), Some(display_name));
+
+    let html = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    assert!(!html.contains("<script>alert"));
+    assert!(html.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;"));
+}
+
+#[test]
+fn overlong_request_target_is_rejected_without_panic() {
+    let fixture = Fixture::new();
+    let server = Server::start(fixture.path(), false);
+    let path = format!("/{}", "a".repeat(4096));
+    let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let response = raw_request(server.addr(), raw.as_bytes());
+    assert_eq!(response.status, 400);
+    assert!(!response.body.contains("panic"));
+}
+
+fn write_snapshot(root: &Path, name: &str, contents: &str) {
+    let directory = root.join("run").join("status");
+    std::fs::create_dir_all(&directory).expect("snapshot directory");
+    std::fs::write(directory.join(name), contents).expect("write snapshot");
+}
+
+fn fresh_timestamp() -> String {
+    now_rfc3339().expect("timestamp")
+}
+
+fn write_fresh_status_snapshots(root: &Path) {
+    let updated_at = fresh_timestamp();
+    write_snapshot(
+        root,
+        "fleet.json",
+        &format!(
+            r#"{{"updated_at":"{updated_at}","hosts":[{{"host_id":"host-alpha","reachable":true,"model_count":2,"latency_ms":7,"error":null}}]}}"#
+        ),
+    );
+    write_snapshot(
+        root,
+        "gpu.json",
+        &format!(
+            r#"{{"updated_at":"{updated_at}","available":true,"name":"NVIDIA RTX","utilization_percent":12,"free_vram_mb":6144,"temperature_c":55,"error":null}}"#
+        ),
+    );
+    write_snapshot(
+        root,
+        "inference.json",
+        &format!(
+            r#"{{"updated_at":"{updated_at}","active":true,"model":"aegis-small","host_id":"host-alpha","detail":null}}"#
+        ),
+    );
+    write_snapshot(
+        root,
+        "service.json",
+        &format!(
+            r#"{{"updated_at":"{updated_at}","running":true,"pid":4242,"pid_alive":true,"socket_reachable":true,"error":null}}"#
+        ),
+    );
+}
+
+#[test]
+fn dashboard_renders_fresh_status_snapshot_sections() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    write_fresh_status_snapshots(fixture.path());
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/");
+    assert_eq!(root.status, 200);
+    for marker in [
+        "Fleet",
+        "host-alpha",
+        "GPU",
+        "NVIDIA RTX",
+        "Inference",
+        "aegis-small",
+        "Service",
+        "Live platform service status snapshot",
+    ] {
+        assert!(root.body.contains(marker), "dashboard missing {marker}");
+    }
+    assert!(!root.body.contains("STALE:"));
+
+    let workspace = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    for marker in [
+        "Fleet",
+        "host-alpha",
+        "GPU",
+        "NVIDIA RTX",
+        "Inference",
+        "aegis-small",
+        "Service",
+    ] {
+        assert!(workspace.contains(marker), "workspace missing {marker}");
+    }
+}
+
+#[test]
+fn stale_status_snapshot_renders_stale_not_values() {
+    let fixture = Fixture::new();
+    write_snapshot(
+        fixture.path(),
+        "service.json",
+        r#"{"updated_at":"2000-01-01T00:00:00Z","running":true,"pid":4242,"pid_alive":true,"socket_reachable":true,"error":null}"#,
+    );
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/").body;
+    assert!(root.contains("STALE"), "missing STALE badge");
+    assert!(root.contains("is stale"), "missing stale reason");
+    assert!(!root.contains("Live platform service status snapshot"));
+
+    let status = get(server.addr(), "/api/status").json();
+    assert_eq!(status["snapshots"]["service"]["state"], "stale");
+    assert!(status["snapshots"]["service"]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("stale")));
+}
+
+#[test]
+fn malformed_status_snapshot_is_unavailable_without_panic() {
+    let fixture = Fixture::new();
+    let directory = fixture.path().join("run").join("status");
+    std::fs::create_dir_all(&directory).expect("snapshot directory");
+    std::fs::write(directory.join("gpu.json"), b"{not-json").expect("write malformed snapshot");
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/");
+    assert_eq!(root.status, 200);
+    assert!(root.body.contains("UNAVAILABLE"));
+    assert!(root.body.contains("GPU"));
+    assert!(!root.body.contains("panic"));
+
+    let status = get(server.addr(), "/api/status").json();
+    assert_eq!(status["snapshots"]["gpu"]["state"], "unavailable");
+    assert!(status["snapshots"]["gpu"]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("malformed")));
+}
+
+#[test]
+fn missing_status_snapshots_are_unavailable() {
+    let fixture = Fixture::new();
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/").body;
+    assert!(root.contains("UNAVAILABLE"));
+    assert!(root.contains("Fleet"));
+    assert!(root.contains("GPU"));
+    assert!(root.contains("Inference"));
+    assert!(root.contains("Service"));
+    assert!(!root.contains("Live fleet status snapshot"));
+
+    let status = get(server.addr(), "/api/status").json();
+    for section in ["fleet", "gpu", "inference", "service"] {
+        assert_eq!(
+            status["snapshots"][section]["state"], "unavailable",
+            "{section} should be unavailable"
+        );
+        assert!(
+            status["snapshots"][section]["reason"].is_string(),
+            "{section} should carry a reason"
+        );
+    }
+}
+
+#[test]
+fn status_api_exposes_snapshot_states_and_preserves_platform_fields() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    write_fresh_status_snapshots(fixture.path());
+    let server = Server::start(fixture.path(), false);
+
+    let status = get(server.addr(), "/api/status").json();
+    assert_eq!(status["core_count"].as_u64(), Some(1));
+    assert!(status["zero_core"].is_boolean());
+
+    let snapshots = &status["snapshots"];
+    assert_eq!(snapshots["schema"], "aegis.ui.status_snapshots.v1");
+    for section in ["fleet", "gpu", "inference", "service"] {
+        assert_eq!(snapshots[section]["state"], "fresh", "{section} state");
+        assert!(
+            snapshots[section]["reason"].is_null(),
+            "{section} fresh reason should be null"
+        );
+    }
+}
+
+fn world_snapshot_json(updated_at: &str, condition: &str, temperature: f64) -> String {
+    serde_json::json!({
+        "updated_at": updated_at,
+        "local_time": "12:00",
+        "timezone": "UTC",
+        "time_of_day": "midday",
+        "season": "autumn",
+        "weather": {
+            "condition": condition,
+            "temperature_celsius": temperature
+        }
+    })
+    .to_string()
+}
+
+fn personal_snapshot_json(updated_at: &str, continuity: &str) -> String {
+    serde_json::json!({
+        "updated_at": updated_at,
+        "core_uuid": CORE_A,
+        "emotion": {
+            "valence": 0.4,
+            "calm": 0.8
+        },
+        "continuity": {
+            "summary": continuity
+        },
+        "activities": [{ "title": "Reading" }],
+        "routines": [{ "name": "Morning check-in" }],
+        "outfit": {
+            "id": "outfit-1",
+            "decided_at": updated_at,
+            "asset_ids": ["asset-1", "asset-2"],
+            "rationale": "warm and simple"
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn dashboard_renders_fresh_world_and_personal_snapshots() {
+    let fixture = Fixture::new();
+    fixture.add_core(CORE_A, 1, "Core A");
+    let now = fresh_timestamp();
+    write_snapshot(
+        fixture.path(),
+        "world.json",
+        &world_snapshot_json(&now, "clear skies", 12.5),
+    );
+    write_snapshot(
+        fixture.path(),
+        "personal.json",
+        &personal_snapshot_json(&now, "kept a journal"),
+    );
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/");
+    assert_eq!(root.status, 200);
+    for marker in [
+        "World",
+        "Personal",
+        "Emotion",
+        "Continuity",
+        "Outfit",
+        "UTC",
+        "12:00",
+        "midday",
+        "autumn",
+        "clear skies",
+        "12.5",
+        "valence=0.40",
+        "calm=0.80",
+        "kept a journal",
+        "warm and simple",
+        "asset-1",
+    ] {
+        assert!(root.body.contains(marker), "dashboard missing {marker}");
+    }
+    assert!(!root.body.contains("STALE:"));
+
+    let workspace = get(server.addr(), &format!("/core/{CORE_A}")).body;
+    for marker in [
+        "World",
+        "Personal",
+        "Emotion",
+        "Continuity",
+        "Outfit",
+        "clear skies",
+        "kept a journal",
+        "warm and simple",
+    ] {
+        assert!(workspace.contains(marker), "workspace missing {marker}");
+    }
+
+    let status = get(server.addr(), "/api/status").json();
+    assert_eq!(status["snapshots"]["world"]["state"], "fresh");
+    assert_eq!(status["snapshots"]["personal"]["state"], "fresh");
+    assert!(status["snapshots"]["world"]["reason"].is_null());
+}
+
+#[test]
+fn stale_world_and_personal_snapshots_render_stale_not_values() {
+    let fixture = Fixture::new();
+    let old = "2000-01-01T00:00:00Z";
+    write_snapshot(
+        fixture.path(),
+        "world.json",
+        &world_snapshot_json(old, "impossible-weather", 99.0),
+    );
+    write_snapshot(
+        fixture.path(),
+        "personal.json",
+        &personal_snapshot_json(old, "ancient-summary"),
+    );
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/").body;
+    assert!(root.contains("STALE"), "missing STALE badge");
+    assert!(root.contains("is stale"), "missing stale reason");
+    assert!(!root.contains("impossible-weather"));
+    assert!(!root.contains("ancient-summary"));
+    assert!(!root.contains("warm and simple"));
+    for title in ["World", "Personal", "Emotion", "Continuity", "Outfit"] {
+        assert!(root.contains(title), "missing section {title}");
+    }
+
+    let status = get(server.addr(), "/api/status").json();
+    for section in ["world", "personal"] {
+        assert_eq!(
+            status["snapshots"][section]["state"], "stale",
+            "{section} should be stale"
+        );
+        assert!(status["snapshots"][section]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("stale")));
+    }
+}
+
+#[test]
+fn missing_world_and_personal_snapshots_are_unavailable() {
+    let fixture = Fixture::new();
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/").body;
+    for title in ["World", "Personal", "Emotion", "Continuity", "Outfit"] {
+        assert!(root.contains(title), "missing section {title}");
+    }
+    assert!(root.contains("no world status snapshot is available"));
+    assert!(root.contains("no personal status snapshot is available"));
+
+    let status = get(server.addr(), "/api/status").json();
+    for section in ["world", "personal"] {
+        assert_eq!(
+            status["snapshots"][section]["state"], "unavailable",
+            "{section} should be unavailable"
+        );
+        assert!(status["snapshots"][section]["reason"].is_string());
+    }
+}
+
+#[test]
+fn malformed_world_and_personal_snapshots_are_unavailable_without_panic() {
+    let fixture = Fixture::new();
+    write_snapshot(fixture.path(), "world.json", "{not-json");
+    write_snapshot(fixture.path(), "personal.json", "{not-json");
+    let server = Server::start(fixture.path(), false);
+
+    let root = get(server.addr(), "/");
+    assert_eq!(root.status, 200);
+    assert!(root.body.contains("UNAVAILABLE"));
+    assert!(root.body.contains("malformed JSON"));
+    assert!(!root.body.contains("panic"));
+    for title in ["World", "Personal", "Emotion", "Continuity", "Outfit"] {
+        assert!(root.body.contains(title), "missing section {title}");
+    }
+
+    let status = get(server.addr(), "/api/status").json();
+    for section in ["world", "personal"] {
+        assert_eq!(status["snapshots"][section]["state"], "unavailable");
+        assert!(status["snapshots"][section]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("malformed")));
+    }
+}
+
+#[test]
+fn fresh_personal_snapshot_missing_emotion_is_not_inferred_available() {
+    let fixture = Fixture::new();
+    let now = fresh_timestamp();
+    let mut value: Value = serde_json::from_str(&personal_snapshot_json(&now, "kept a journal"))
+        .expect("personal JSON");
+    value
+        .as_object_mut()
+        .expect("personal object")
+        .remove("emotion");
+    write_snapshot(fixture.path(), "personal.json", &value.to_string());
+    let server = Server::start(fixture.path(), false);
+
+    let body = get(server.addr(), "/").body;
+    assert!(body.contains("Emotion"));
+    assert!(body.contains("reports no emotion data"));
+    assert!(body.contains("kept a journal"));
+    assert!(body.contains("warm and simple"));
+}
+
+#[test]
+fn world_and_personal_snapshot_text_is_html_escaped() {
+    let fixture = Fixture::new();
+    let now = fresh_timestamp();
+    write_snapshot(
+        fixture.path(),
+        "world.json",
+        &world_snapshot_json(&now, "<script>alert(\"x\")</script>", 1.0),
+    );
+    write_snapshot(
+        fixture.path(),
+        "personal.json",
+        &personal_snapshot_json(&now, "<script>alert('y')</script>&"),
+    );
+    let server = Server::start(fixture.path(), false);
+
+    let body = get(server.addr(), "/").body;
+    assert!(!body.contains("<script>alert"));
+    assert!(body.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"));
+    assert!(body.contains("&lt;script&gt;alert(&#39;y&#39;)&lt;/script&gt;&amp;"));
+}

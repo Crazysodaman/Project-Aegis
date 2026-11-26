@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use aegis_contracts::core::canonicalize_core_id;
+use aegis_core_sdk::{CoreMemoryStore, MemoryKind, NewMemory};
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_storage::{now_rfc3339, open_initialized};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -44,6 +45,17 @@ pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 pub const MAX_MESSAGES_PER_READ: usize = 500;
 /// Maximum sessions exported at once.
 pub const MAX_SESSIONS_PER_ARCHIVE: usize = 500;
+
+/// Schema identifier for a bounded session summary.
+pub const SESSION_SUMMARY_SCHEMA: &str = "aegis.conversation.summary.v1";
+/// Maximum important experiences accepted by one consolidation call.
+pub const MAX_CONSOLIDATION_BATCH: usize = 32;
+/// Maximum characters of one consolidated experience.
+pub const MAX_CONSOLIDATION_CONTENT_CHARS: usize = 512;
+/// Stable prefix for the `source` key of a consolidated memory.
+pub const CONSOLIDATION_SOURCE_PREFIX: &str = "conversation.experience";
+/// Provenance recorded on a consolidated memory.
+pub const CONSOLIDATION_PROVENANCE: &str = "conversation.consolidation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +150,69 @@ pub struct SessionEvent {
     pub event_type: String,
     pub detail: Value,
     pub created_at: String,
+}
+
+/// Bounded, metadata-only summary of one session.
+///
+/// The summary deliberately contains no message content so it can be surfaced
+/// or persisted without dumping a transcript. Counts are derived from stored
+/// messages and are checked against the session's maintained `message_count`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub schema: String,
+    pub core_uuid: String,
+    pub session_id: String,
+    pub state: SessionState,
+    pub message_count: u64,
+    pub system_message_count: u64,
+    pub user_message_count: u64,
+    pub assistant_message_count: u64,
+    pub tool_message_count: u64,
+    pub first_message_at: Option<String>,
+    pub last_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+/// One caller-designated important experience to consolidate into memory.
+///
+/// Consolidation is explicit: the caller decides what is important. The store
+/// never scans or summarizes transcripts on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportantExperience {
+    pub summary: String,
+}
+
+impl ImportantExperience {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+        }
+    }
+}
+
+impl From<&str> for ImportantExperience {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ImportantExperience {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Outcome of one explicit experience-consolidation call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsolidationOutcome {
+    /// Memories created by this call.
+    pub created: usize,
+    /// Experiences already consolidated under the same stable source key.
+    pub skipped: usize,
+    /// Experiences whose stored content was shortened to the bounded length.
+    pub truncated: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -475,6 +550,65 @@ impl ConversationStore {
             .map_err(ConversationError::from)
     }
 
+    /// Produce a bounded, metadata-only summary of a session.
+    ///
+    /// No message content is read or returned. Counts are verified against the
+    /// session's maintained `message_count` so silent drift is surfaced as
+    /// corrupt data rather than reported as a plausible summary.
+    pub fn session_summary(&self, session_id: &str) -> Result<SessionSummary, ConversationError> {
+        let session = self.session(session_id)?;
+        let mut counts = [0u64; 4];
+        let mut statement = self.connection.prepare(
+            "SELECT role, COUNT(*) FROM conversation_messages
+             WHERE session_id = ?1 GROUP BY role",
+        )?;
+        let mut rows = statement.query([session_id])?;
+        while let Some(row) = rows.next()? {
+            let role: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let count = u64::try_from(count)
+                .map_err(|_| ConversationError::CorruptData("message count"))?;
+            let slot = match MessageRole::parse(&role) {
+                Some(MessageRole::System) => 0,
+                Some(MessageRole::User) => 1,
+                Some(MessageRole::Assistant) => 2,
+                Some(MessageRole::Tool) => 3,
+                None => return Err(ConversationError::CorruptData("message role")),
+            };
+            counts[slot] = count;
+        }
+        let total = counts
+            .iter()
+            .try_fold(0u64, |sum, count| sum.checked_add(*count));
+        let total = total.ok_or(ConversationError::CorruptData("message count"))?;
+        if total != session.message_count {
+            return Err(ConversationError::CorruptData("message count mismatch"));
+        }
+        let (first_message_at, last_message_at): (Option<String>, Option<String>) =
+            self.connection.query_row(
+                "SELECT MIN(created_at), MAX(created_at) FROM conversation_messages
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        Ok(SessionSummary {
+            schema: SESSION_SUMMARY_SCHEMA.to_owned(),
+            core_uuid: self.core_uuid.clone(),
+            session_id: session.session_id,
+            state: session.state,
+            message_count: session.message_count,
+            system_message_count: counts[0],
+            user_message_count: counts[1],
+            assistant_message_count: counts[2],
+            tool_message_count: counts[3],
+            first_message_at,
+            last_message_at,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            revision: session.revision,
+        })
+    }
+
     pub fn session_events(&self, session_id: &str) -> Result<Vec<SessionEvent>, ConversationError> {
         self.session(session_id)?;
         let mut statement = self.connection.prepare(
@@ -540,6 +674,60 @@ impl ConversationStore {
             exported_at: now_rfc3339()?,
             sessions: exports,
         })
+    }
+
+    /// Explicitly consolidate caller-designated important experiences into
+    /// this Core's private memory as `episode` entries.
+    ///
+    /// The session must belong to the same Core as `memory`; a mismatch is
+    /// rejected before anything is written. Each experience receives a stable
+    /// source key derived from the session id and the stored content, so
+    /// repeated calls (including reordered batches) are idempotent. Content is
+    /// character-truncated to [`MAX_CONSOLIDATION_CONTENT_CHARS`], and an
+    /// oversized batch is rejected. Empty or whitespace-only entries are
+    /// ignored.
+    pub fn consolidate_experiences(
+        &self,
+        memory: &CoreMemoryStore,
+        session_id: &str,
+        experiences: &[ImportantExperience],
+    ) -> Result<ConsolidationOutcome, ConversationError> {
+        if memory.core_uuid() != self.core_uuid {
+            return Err(ConversationError::OwnershipMismatch);
+        }
+        self.session(session_id)?;
+        if experiences.len() > MAX_CONSOLIDATION_BATCH {
+            return Err(ConversationError::InvalidInput("too many experiences"));
+        }
+
+        let mut outcome = ConsolidationOutcome::default();
+        for experience in experiences {
+            let trimmed = experience.summary.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (content, was_truncated) = truncate_chars(trimmed, MAX_CONSOLIDATION_CONTENT_CHARS);
+            let source = stable_source_key(session_id, &content);
+            if !memory.find_by_source(&source)?.is_empty() {
+                outcome.skipped += 1;
+                continue;
+            }
+            memory.create(
+                NewMemory::new(MemoryKind::Episode, &content)
+                    .with_source(source)
+                    .with_provenance(format!("{CONSOLIDATION_PROVENANCE}:{session_id}"))
+                    .with_confidence(0.75)
+                    .with_tags(vec![
+                        "consolidation".to_owned(),
+                        format!("session:{session_id}"),
+                    ]),
+            )?;
+            outcome.created += 1;
+            if was_truncated {
+                outcome.truncated += 1;
+            }
+        }
+        Ok(outcome)
     }
 
     fn transition(
@@ -787,6 +975,31 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationMessage
         metadata,
         created_at: row.get(9)?,
     })
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> (String, bool) {
+    if value.chars().count() <= maximum {
+        return (value.to_owned(), false);
+    }
+    (value.chars().take(maximum).collect(), true)
+}
+
+fn stable_source_key(session_id: &str, content: &str) -> String {
+    format!(
+        "{}:{}:{:016x}",
+        CONSOLIDATION_SOURCE_PREFIX,
+        session_id,
+        stable_hash(content)
+    )
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn validate_session_id(value: &str) -> Result<(), ConversationError> {

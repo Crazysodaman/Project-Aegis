@@ -13,6 +13,7 @@ aegis-modules.workspace = true
 aegis-safe.workspace = true
 aegis-storage.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

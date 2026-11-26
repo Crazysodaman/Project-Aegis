@@ -13,6 +13,14 @@
 //! This crate never creates Cores, never runs Cores, and never touches the
 //! legacy Sofía repository.
 
+pub mod preflight;
+
+pub use preflight::{
+    preflight_install, preflight_uninstall, preflight_upgrade, rollback_plan_install,
+    rollback_plan_uninstall, rollback_plan_upgrade, PreflightAction, PreflightCheck,
+    PreflightReport, PreflightStatus, RollbackError, RollbackPlan, RollbackStep,
+};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

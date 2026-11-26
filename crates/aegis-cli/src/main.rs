@@ -11,14 +11,19 @@ use aegis_cognition::{
 use aegis_contracts::initialization::{CoreInitializationRequest, CORE_INIT_REQUEST_SCHEMA};
 use aegis_contracts::ipc::IpcRequest;
 use aegis_conversation::{ConversationEngine, EmbeddingRetriever, TurnOptions};
-use aegis_core_install::{CoreInspection, CoreInstallation, CoreInstaller};
+use aegis_core_install::{install_package, CoreInspection, CoreInstallation, CoreInstaller};
 use aegis_core_runtime::CoreRuntime;
-use aegis_core_sdk::{CoreMemoryStore, MemoryKind, MemoryQuery, NewMemory};
+use aegis_core_sdk::{CoreMemoryStore, CoreSdkContext, MemoryKind, MemoryQuery, NewMemory};
 use aegis_diagnostics::Diagnostics;
 use aegis_embeddings::{EmbeddingProvider, HashingEmbeddingProvider, OllamaEmbeddingProvider};
-use aegis_embodiment::{AssetKind, EmbodimentStore, NewAsset, Theme, VoiceProfile};
+use aegis_embodiment::voice::TtsStyle;
+use aegis_embodiment::{
+    AssetKind, AudioFormat, EmbodimentStore, NewAsset, SapiTtsProvider, Theme, TtsProvider,
+    TtsRequest, VoiceProfile,
+};
 use aegis_fleet::{
-    fleet_store, GpuPolicy, GpuProbe, GpuSupervisor, HostRole, NvidiaSmiProbe, SupervisorConfig,
+    detect_gaming, fleet_store, GamingPolicy, GpuPolicy, GpuProbe, GpuSupervisor, HostRole,
+    NvidiaSmiProbe, SupervisorConfig,
 };
 use aegis_host::HostStore;
 use aegis_installer::{install, uninstall, upgrade, InstallMode, UninstallMode};
@@ -26,7 +31,9 @@ use aegis_ipc::{
     request_status, request_stop_clear, request_stop_set, request_stop_status, IpcClient, IpcServer,
 };
 use aegis_modules::{ModuleManager, ModuleRuntime, ModuleRuntimeStatus};
-use aegis_platform::PlatformService;
+use aegis_platform::{
+    OpenMeteoProvider, PlatformService, UnavailableWeatherProvider, WorldService,
+};
 use aegis_roster::{resolve_display_name, validate_roster, ApprovedCoreDesign};
 use aegis_service::ServiceManager;
 use aegis_social::{
@@ -76,6 +83,9 @@ fn run() -> Result<(), String> {
         Some("tool") => command_tool(&args),
         Some("social") => command_social(&args),
         Some("fleet") => command_fleet(&args),
+        Some("world") => command_world(&args),
+        Some("personal") => command_personal(&args),
+        Some("voice") => command_voice(&args),
         Some("effect") => command_effect(&args),
         Some("ipc") => command_ipc(&args),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -283,6 +293,18 @@ fn command_core(args: &[String]) -> Result<(), String> {
             let installation = installer
                 .initialize(&request, &token)
                 .map_err(|error| error.to_string())?;
+            print_json(&installation_payload(&installation))
+        }
+        "install-package" => {
+            let package_path = args
+                .get(2)
+                .ok_or_else(|| "missing positional package path".to_owned())?;
+            let platform =
+                PlatformService::start(PathBuf::from(root)).map_err(|error| error.to_string())?;
+            let token = platform.owner_token().map_err(|error| error.to_string())?;
+            let installation =
+                install_package(PathBuf::from(root), PathBuf::from(package_path), &token)
+                    .map_err(|error| error.to_string())?;
             print_json(&installation_payload(&installation))
         }
         "init" => {
@@ -960,11 +982,11 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
         }
         "gpu" => match args.get(2).map(String::as_str).unwrap_or("status") {
             "status" => print_json(
-                &serde_json::to_value(NvidiaSmiProbe::new().probe())
+                &serde_json::to_value(gpu_probe(args).probe())
                     .map_err(|error| error.to_string())?,
             ),
             "admission" => {
-                let telemetry = NvidiaSmiProbe::new().probe();
+                let telemetry = gpu_probe(args).probe();
                 let decision = store
                     .admission(&telemetry)
                     .map_err(|error| error.to_string())?;
@@ -1001,6 +1023,12 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
                     "unloaded": true,
                 }))
             }
+            "detect-gaming" => {
+                let processes = all_args(args, "--game-process");
+                let policy = GamingPolicy::new(!processes.is_empty(), processes)?;
+                let signal = detect_gaming(&policy);
+                print_json(&serde_json::to_value(signal).map_err(|error| error.to_string())?)
+            }
             "supervise" => {
                 let dry_run = has_flag(args, "--dry-run");
                 if !dry_run {
@@ -1015,6 +1043,14 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
                     .policy()
                     .map_err(|error| error.to_string())?
                     .gpu_policy();
+                let gaming_policy = {
+                    let processes = all_args(args, "--game-process");
+                    if processes.is_empty() {
+                        None
+                    } else {
+                        Some(GamingPolicy::new(true, processes)?)
+                    }
+                };
                 let iterations = parse_usize(args, "--iterations", 1)?;
                 if iterations == 0 || iterations > 1000 {
                     return Err("--iterations must be 1-1000".to_owned());
@@ -1032,15 +1068,26 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
                 })
                 .map_err(|error| error.to_string())?;
                 let mut supervisor = supervisor;
+                for workload in all_args(args, "--defer") {
+                    supervisor.defer(&workload);
+                }
                 let mut reports = Vec::new();
                 for index in 0..iterations {
-                    let telemetry = NvidiaSmiProbe::new().probe();
+                    let telemetry = gpu_probe(args).probe();
                     let running = provider.running_models().unwrap_or_default();
-                    let report = supervisor.step(&telemetry, &running, &mut |model| {
-                        provider
-                            .unload_model(model)
-                            .map_err(|error| error.to_string())
-                    });
+                    let gaming_signal = gaming_policy.as_ref().map(detect_gaming);
+                    let mut reprobe = || gpu_probe(args).probe();
+                    let report = supervisor.step_full(
+                        &telemetry,
+                        gaming_signal.as_ref(),
+                        &running,
+                        &mut |model| {
+                            provider
+                                .unload_model(model)
+                                .map_err(|error| error.to_string())
+                        },
+                        Some(&mut reprobe),
+                    );
                     reports.push(serde_json::to_value(&report).map_err(|error| error.to_string())?);
                     if index + 1 < iterations {
                         std::thread::sleep(std::time::Duration::from_millis(interval_ms as u64));
@@ -1049,6 +1096,7 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
                 print_json(&json!({
                     "schema": "aegis.cli.gpu_supervision_run.v1",
                     "dry_run": dry_run,
+                    "gaming_detection": gaming_policy.is_some(),
                     "reports": reports,
                 }))
             }
@@ -1088,6 +1136,175 @@ fn command_fleet(args: &[String]) -> Result<(), String> {
             other => Err(format!("unknown fleet policy command: {other}")),
         },
         other => Err(format!("unknown fleet command: {other}")),
+    }
+}
+
+fn command_personal(args: &[String]) -> Result<(), String> {
+    let root = require_arg(args, "--root")?;
+    let core_uuid = require_arg(args, "--core")?;
+    if args.get(1).map(String::as_str).unwrap_or("show") != "show" {
+        return Err(format!(
+            "unknown personal command: {}",
+            args.get(1).map(String::as_str).unwrap_or("")
+        ));
+    }
+    require_owner_proof(root)?;
+    let sdk =
+        CoreSdkContext::open(PathBuf::from(root), core_uuid).map_err(|error| error.to_string())?;
+    let personal = sdk.personal().map_err(|error| error.to_string())?;
+    let emotion = personal
+        .emotion_state()
+        .map_err(|error| error.to_string())?;
+    let continuity = personal
+        .continuity_summary()
+        .map_err(|error| error.to_string())?;
+    let activities = personal
+        .list_activities(16)
+        .map_err(|error| error.to_string())?;
+    let routines = personal
+        .list_routines(16)
+        .map_err(|error| error.to_string())?;
+    print_json(&json!({
+        "schema": "aegis.cli.personal.v1",
+        "core_uuid": core_uuid,
+        "emotion": emotion,
+        "continuity": continuity,
+        "activities": activities,
+        "routines": routines,
+    }))
+}
+
+fn command_voice(args: &[String]) -> Result<(), String> {
+    let subcommand = args.get(1).map(String::as_str).unwrap_or("synthesize");
+    let root = require_arg(args, "--root")?;
+    match subcommand {
+        "synthesize" => {
+            let core_uuid = require_arg(args, "--core")?;
+            let text = require_arg(args, "--text")?;
+            let out = require_arg(args, "--out")?;
+            let rate = optional_arg(args, "--rate")
+                .unwrap_or("100")
+                .parse::<u16>()
+                .map_err(|_| "--rate must be a percentage from 50 to 200".to_owned())?;
+            let volume = optional_arg(args, "--volume")
+                .unwrap_or("100")
+                .parse::<u16>()
+                .map_err(|_| "--volume must be a percentage from 0 to 100".to_owned())?;
+            let style = TtsStyle::new(rate, volume);
+            style.validate().map_err(|error| error.to_string())?;
+
+            require_owner_proof(root)?;
+            let store = EmbodimentStore::open(PathBuf::from(root), core_uuid)
+                .map_err(|error| error.to_string())?;
+            let voice = store.appearance().map_err(|error| error.to_string())?.voice;
+
+            let mut request = TtsRequest::new(text, AudioFormat::Wav).with_style(style);
+            if let Some(voice) = &voice {
+                request = request.with_voice(voice);
+            }
+
+            let provider = SapiTtsProvider::system_default();
+            let result = provider
+                .synthesize(&request)
+                .map_err(|error| error.to_string())?;
+            fs::write(out, &result.audio)
+                .map_err(|error| format!("could not write synthesized audio: {error}"))?;
+
+            print_json(&json!({
+                "schema": "aegis.cli.voice_synthesis.v1",
+                "core_uuid": core_uuid,
+                "provider": result.provider,
+                "voice_id": result.voice_id,
+                "format": result.format.as_str(),
+                "media_type": result.media_type,
+                "rate_percent": style.rate_percent,
+                "volume_percent": style.volume_percent,
+                "path": out,
+                "bytes": result.audio.len(),
+                "played": false,
+            }))
+        }
+        other => Err(format!("unknown voice command: {other}")),
+    }
+}
+
+fn command_world(args: &[String]) -> Result<(), String> {
+    let root = require_arg(args, "--root")?;
+    let paths = StoragePaths::new(PathBuf::from(root)).map_err(|error| error.to_string())?;
+    let service = WorldService::start(paths).map_err(|error| error.to_string())?;
+    match args.get(1).map(String::as_str).unwrap_or("status") {
+        "status" => {
+            let snapshot = if has_flag(args, "--refresh-weather") {
+                refresh_world_snapshot(&service)?
+            } else {
+                match service.latest().map_err(|error| error.to_string())? {
+                    Some(snapshot) => snapshot,
+                    None => refresh_world_snapshot(&service)?,
+                }
+            };
+            print_json(&serde_json::to_value(snapshot).map_err(|error| error.to_string())?)
+        }
+        "weather" => {
+            let snapshot = refresh_world_snapshot(&service)?;
+            print_json(&serde_json::to_value(snapshot).map_err(|error| error.to_string())?)
+        }
+        "set-timezone" => {
+            require_owner_proof(root)?;
+            let timezone = require_arg(args, "--timezone")?;
+            let token = owner_token(root)?;
+            service
+                .set_timezone(&token, timezone)
+                .map_err(|error| error.to_string())?;
+            print_json(&json!({
+                "schema": "aegis.cli.world_config.v1",
+                "timezone": timezone,
+            }))
+        }
+        "set-location" => {
+            require_owner_proof(root)?;
+            let latitude = require_arg(args, "--lat")?
+                .parse::<f64>()
+                .map_err(|_| "--lat must be a number".to_owned())?;
+            let longitude = require_arg(args, "--lon")?
+                .parse::<f64>()
+                .map_err(|_| "--lon must be a number".to_owned())?;
+            let token = owner_token(root)?;
+            service
+                .set_location(&token, latitude, longitude)
+                .map_err(|error| error.to_string())?;
+            print_json(&json!({
+                "schema": "aegis.cli.world_config.v1",
+                "latitude": latitude,
+                "longitude": longitude,
+            }))
+        }
+        other => Err(format!("unknown world command: {other}")),
+    }
+}
+
+fn refresh_world_snapshot(
+    service: &WorldService,
+) -> Result<aegis_contracts::world::WorldSnapshot, String> {
+    let config = service.config().map_err(|error| error.to_string())?;
+    if config.latitude.is_some() && config.longitude.is_some() {
+        let provider = OpenMeteoProvider::new();
+        service
+            .snapshot(&provider)
+            .map_err(|error| error.to_string())
+    } else {
+        let provider = UnavailableWeatherProvider::new();
+        service
+            .snapshot(&provider)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn chat_world_snapshot(root: &str) -> Option<aegis_contracts::world::WorldSnapshot> {
+    let paths = StoragePaths::new(PathBuf::from(root)).ok()?;
+    let service = WorldService::start(paths).ok()?;
+    match service.latest().ok().flatten() {
+        Some(snapshot) => Some(snapshot),
+        None => refresh_world_snapshot(&service).ok(),
     }
 }
 
@@ -1557,6 +1774,26 @@ fn command_chat(args: &[String]) -> Result<(), String> {
                         .map_err(|_| "--timeout-ms must be an integer".to_owned())?,
                 );
             }
+            if !has_flag(args, "--no-context") {
+                if let Some(world) = chat_world_snapshot(root) {
+                    options = options.with_world(world);
+                }
+                if let Ok(sdk) = CoreSdkContext::open(PathBuf::from(root), core_uuid) {
+                    if let Ok(personal) = sdk.personal() {
+                        if let Ok(emotion) = personal.emotion_state() {
+                            options = options.with_emotion(emotion);
+                        }
+                        if let Ok(continuity) = personal.continuity_summary() {
+                            options = options.with_continuity(continuity);
+                        }
+                        if let Ok(activities) = personal.list_activities(8) {
+                            if !activities.is_empty() {
+                                options = options.with_activities(activities);
+                            }
+                        }
+                    }
+                }
+            }
             let cancel = CancelToken::new();
             let turn = engine
                 .send_turn(session_id, prompt, &provider, &options, &cancel)
@@ -1603,6 +1840,11 @@ fn command_chat(args: &[String]) -> Result<(), String> {
                 "memory_used": turn.memory_used,
                 "retrieval_method": turn.retrieval_method,
                 "retrieval_semantic": turn.retrieval_semantic,
+                "world_used": turn.world_used,
+                "continuity_used": turn.continuity_used,
+                "emotion_used": turn.emotion_used,
+                "activities_used": turn.activities_used,
+                "personal_update_warning": turn.personal_update_warning,
             }))
         }
         other => Err(format!("unknown chat command: {other}")),
@@ -1899,6 +2141,21 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|argument| argument == name)
 }
 
+fn gpu_probe(args: &[String]) -> NvidiaSmiProbe {
+    match optional_arg(args, "--nvidia-smi") {
+        Some(binary) => NvidiaSmiProbe::new().with_binary(binary),
+        None => NvidiaSmiProbe::new(),
+    }
+}
+
+fn all_args(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.as_str() == name)
+        .filter_map(|(index, _)| args.get(index + 1).cloned())
+        .collect()
+}
+
 fn print_json(value: &Value) -> Result<(), String> {
     let encoded = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     println!("{encoded}");
@@ -1932,6 +2189,7 @@ fn usage() {
          aegis core profile <core-number>\n\
          aegis core apply-profile <core-id> --root <path>\n\
          aegis core install <core-id> --root <path> --roster <n> [--name <name>]\n\
+         aegis core install-package <package-path> --root <path>\n\
          aegis core init <core-id> --root <path> --number <n> --name <name>\n\
          aegis core inspect <core-id> --root <path>\n\
          aegis core verify <core-id> --root <path>\n\
@@ -1967,6 +2225,11 @@ fn usage() {
          aegis fleet placement|route --root <path> [--model <name>]\n\
          aegis fleet gpu status|admission|running --root <path>\naegis fleet gpu yield --model <name> --root <path> [--url <url>]\naegis fleet gpu supervise --root <path> [--iterations <n>] [--interval-ms <n>] [--busy-samples <n>] [--idle-samples <n>] [--dry-run]\n\
          aegis fleet policy show|set --root <path> [--no-gaming-yield] [--max-utilization <n>] [--min-free-vram <n>] [--max-temperature <n>]\n\
+         aegis world status|weather --root <path> [--refresh-weather]\n\
+         aegis world set-timezone --root <path> --timezone <iana>\n\
+         aegis world set-location --root <path> --lat <degrees> --lon <degrees>\n\
+         aegis personal show --root <path> --core <core-id>\n\
+         aegis voice synthesize --root <path> --core <core-id> --text <text> --out <wav> [--rate <percent>] [--volume <percent>]\n\
          aegis asset import <core-id> <kind> <file> --root <path> [--name <name>] [--media-type <type>] [--tags a,b]\n\
          aegis asset list <core-id> --root <path> [--kind <kind>] [--include-deleted]\n\
          aegis asset show|delete <core-id> <asset-id> --root <path>\n\

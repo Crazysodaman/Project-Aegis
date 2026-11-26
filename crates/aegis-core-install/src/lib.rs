@@ -23,6 +23,15 @@ use aegis_safe::{SafeError, SafeStore};
 use aegis_storage::{now_rfc3339, StorageError, StoragePaths};
 use thiserror::Error;
 
+mod package;
+
+pub use package::{
+    install_package, install_package_bytes, validate_package, validate_package_bytes,
+    CorePackageFile, CorePackageManifest, CorePackageSource, PackageError, ValidatedCorePackage,
+    ValidatedPackage, CORE_PACKAGE_FORMAT_VERSION, CORE_PACKAGE_MANIFEST_FILE, CORE_PACKAGE_SCHEMA,
+    MAX_PACKAGE_FILES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_MANIFEST_BYTES, MAX_PACKAGE_PATH_BYTES,
+};
+
 #[derive(Debug, Error)]
 pub enum InstallError {
     #[error("Core identity or initialization state failed: {0}")]

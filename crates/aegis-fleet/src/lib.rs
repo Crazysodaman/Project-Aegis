@@ -18,17 +18,79 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod agent_plan;
+pub mod capabilities;
+pub mod deployment;
+pub mod doctor;
+pub mod freshness;
+pub mod gaming;
 pub mod gpu;
+pub mod measurement;
+pub mod performance;
+pub mod remote;
 pub mod supervisor;
+pub mod transport;
 
+pub use agent_plan::{
+    build_agent_plan, preflight_agent_plan, AgentEnvSpec, AgentFileSpec, AgentPlanOptions,
+    AgentPreflight, AgentPreflightInput, AgentStep, FleetAgentPlan, AGENT_PLAN_SCHEMA,
+    AGENT_PREFLIGHT_SCHEMA, BLOCKER_AGENT_BINARY_MISSING, BLOCKER_ENDPOINT_MISSING,
+    BLOCKER_INFERENCE_WITHOUT_ENDPOINT,
+};
+pub use capabilities::{HostCapabilities, HOST_CAPABILITIES_SCHEMA, INFERENCE_CAPABILITY};
+pub use deployment::{
+    evaluate_deployment_readiness, render_agent_config, AgentConfigTemplate, DeploymentInput,
+    DeploymentReadiness, ReadinessBlocker, ReadinessSeverity, TemplateError, TemplateFormat,
+    AGENT_CONFIG_TEMPLATE_SCHEMA, DEFAULT_AGENT_BIND, DEFAULT_SECRET_ENV_VAR,
+    DEFAULT_TLS_PROXY_NOTE, DEPLOYMENT_READINESS_SCHEMA,
+};
+pub use doctor::{
+    run_doctor, DoctorInput, DoctorReport, DOCTOR_REPORT_SCHEMA, WARNING_HOST_NEVER_PROBED,
+    WARNING_HOST_STALE, WARNING_HOST_UNREACHABLE,
+};
+pub use freshness::{
+    host_eligibility, host_status, summarize_hosts, HostEligibility, HostEligibilityReason,
+    HostStatus, HostStatusSummary, DEFAULT_HOST_STALE_AFTER_SECONDS, HOST_ELIGIBILITY_SCHEMA,
+    HOST_STATUS_SCHEMA, HOST_STATUS_SUMMARY_SCHEMA,
+};
+pub use gaming::{
+    detect_gaming, list_process_names, normalize_process_name, GamingPolicy, GamingProbe,
+    GamingSignal, ProcessGameProbe, GAMING_SIGNAL_SCHEMA, MAX_GAME_PROCESSES,
+    MAX_GAME_PROCESS_NAME_LEN,
+};
 pub use gpu::{
-    evaluate_admission, parse_nvidia_smi_line, AdmissionDecision, GpuPolicy, GpuProbe,
-    GpuTelemetry, NvidiaSmiProbe, DEFAULT_MAX_TEMPERATURE_C, DEFAULT_MAX_UTILIZATION_PERCENT,
-    DEFAULT_MIN_FREE_VRAM_MB, GPU_ADMISSION_SCHEMA, GPU_TELEMETRY_SCHEMA,
+    evaluate_admission, evaluate_admission_with_gaming, parse_nvidia_smi_line, AdmissionDecision,
+    GpuPolicy, GpuProbe, GpuTelemetry, NvidiaSmiProbe, DEFAULT_MAX_TEMPERATURE_C,
+    DEFAULT_MAX_UTILIZATION_PERCENT, DEFAULT_MIN_FREE_VRAM_MB, GPU_ADMISSION_SCHEMA,
+    GPU_TELEMETRY_SCHEMA,
+};
+pub use measurement::{
+    capture_telemetry_series, compare_conditions, render_comparison_report, render_pressure_report,
+    summarize_pressure, CaptureConfig, CaptureError, ComparisonReport, ConditionComparison,
+    ConditionLabel, DeltaStatus, LabeledMeasurement, MetricDelta, MetricKind, PressurePhase,
+    PressureReport, COMPARISON_REPORT_SCHEMA, MAX_CAPTURE_INTERVAL_MS, MAX_CAPTURE_SAMPLES,
+    PRESSURE_REPORT_SCHEMA,
+};
+pub use performance::{
+    classify_workload, load_frame_time_report, parse_frame_times_csv, render_summary_csv,
+    render_summary_report, summarize_frame_times, summarize_telemetry, FrameTimeError,
+    FrameTimeReport, PerformanceSummary, TelemetrySeries, WorkloadClass, WorkloadClassification,
+    FRAME_TIME_REPORT_SCHEMA, PERFORMANCE_SUMMARY_SCHEMA, TELEMETRY_SERIES_SCHEMA,
+    WORKLOAD_CLASSIFICATION_SCHEMA,
+};
+pub use remote::{
+    hmac_sha256, verify_response, RemoteChallenge, RemoteIdentity, RemoteIdentityError,
+    RemoteResponse, MIN_SECRET_BYTES, REMOTE_CHALLENGE_SCHEMA, REMOTE_PROOF_DOMAIN,
+    REMOTE_RESPONSE_SCHEMA,
 };
 pub use supervisor::{
-    GpuSupervisor, SupervisionReport, SupervisorAction, SupervisorConfig, SupervisorMode,
-    SUPERVISION_SCHEMA,
+    GpuSupervisor, ResourceRecovery, SupervisionReport, SupervisorAction, SupervisorConfig,
+    SupervisorMode, MAX_DEFERRED_WORKLOADS, SUPERVISION_SCHEMA,
+};
+pub use transport::{
+    classify_endpoint, validate_endpoint_security, EndpointClass, EndpointSecurity, ParsedEndpoint,
+    TransportError, TransportPolicy, TransportScheme, DEFAULT_OLLAMA_PORT,
+    OLLAMA_ADAPTER_TRANSPORT_NOTE, TRANSPORT_SECURITY_SCHEMA,
 };
 
 /// Schema identifier for a Fleet host record.
@@ -313,15 +375,32 @@ impl FleetStore {
         self.host(host_id)
     }
 
-    /// Enrolled, trusted, health-known hosts ordered by priority then latency.
+    /// Enrolled, trusted, healthy hosts ordered by priority then latency.
+    ///
+    /// A host is healthy only when its most recent probe was reachable and is no
+    /// older than [`DEFAULT_HOST_STALE_AFTER_SECONDS`]. Use
+    /// [`FleetStore::placements_at`] to supply a different reference time or
+    /// freshness window.
     pub fn placements(&self) -> Result<Vec<PlacementCandidate>, FleetError> {
+        let now = now_rfc3339()?;
+        self.placements_at(&now, DEFAULT_HOST_STALE_AFTER_SECONDS)
+    }
+
+    /// Placement candidates evaluated against `now` and `max_age_seconds`.
+    pub fn placements_at(
+        &self,
+        now: &str,
+        max_age_seconds: u64,
+    ) -> Result<Vec<PlacementCandidate>, FleetError> {
         let mut candidates: Vec<PlacementCandidate> = self
             .list_hosts()?
             .into_iter()
             .filter(|host| {
                 host.enrolled
                     && host.trusted
-                    && host.health.as_ref().is_some_and(|health| health.reachable)
+                    && host.health.as_ref().is_some_and(|health| {
+                        health.reachable && health.is_fresh(now, max_age_seconds)
+                    })
             })
             .map(|host| PlacementCandidate {
                 host_id: host.host_id,
@@ -344,6 +423,42 @@ impl FleetStore {
                 .then_with(|| left.callsign.cmp(&right.callsign))
         });
         Ok(candidates)
+    }
+
+    /// Read-only diagnostic summary of host enrollment, trust, and freshness.
+    pub fn host_summary(&self) -> Result<HostStatusSummary, FleetError> {
+        let now = now_rfc3339()?;
+        self.host_summary_at(&now, DEFAULT_HOST_STALE_AFTER_SECONDS)
+    }
+
+    /// Diagnostic summary evaluated against an explicit reference time.
+    pub fn host_summary_at(
+        &self,
+        now: &str,
+        max_age_seconds: u64,
+    ) -> Result<HostStatusSummary, FleetError> {
+        let hosts = self.list_hosts()?;
+        Ok(summarize_hosts(&hosts, now, max_age_seconds))
+    }
+
+    /// Reconnect/placement eligibility for one host at the current time.
+    ///
+    /// Additive companion to [`FleetStore::placements`]: it returns an explicit
+    /// [`HostEligibilityReason`] instead of silently dropping the host.
+    pub fn host_eligibility(&self, host_id: &str) -> Result<HostEligibility, FleetError> {
+        let now = now_rfc3339()?;
+        self.host_eligibility_at(host_id, &now, DEFAULT_HOST_STALE_AFTER_SECONDS)
+    }
+
+    /// Eligibility for one host evaluated against an explicit reference time.
+    pub fn host_eligibility_at(
+        &self,
+        host_id: &str,
+        now: &str,
+        max_age_seconds: u64,
+    ) -> Result<HostEligibility, FleetError> {
+        let host = self.host(host_id)?;
+        Ok(host_eligibility(&host, now, max_age_seconds))
     }
 
     /// Select an enrolled healthy host that currently exposes `model`.

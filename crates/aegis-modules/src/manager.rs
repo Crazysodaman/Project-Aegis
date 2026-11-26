@@ -127,6 +127,16 @@ impl ModuleManager {
         Ok(self.paths.root().join("modules").join(module_id))
     }
 
+    /// Read-only enable precondition check (no owner proof or mutation).
+    pub fn check_enable(&self, module_id: &str) -> Result<(), ModuleError> {
+        self.registry.check_enable(module_id)
+    }
+
+    /// Read-only disable precondition check (no owner proof or mutation).
+    pub fn check_disable(&self, module_id: &str) -> Result<(), ModuleError> {
+        self.registry.check_disable(module_id)
+    }
+
     pub fn enable(&self, module_id: &str, owner_token: &str) -> Result<ModuleRecord, ModuleError> {
         self.authorize(owner_token)?;
         self.registry.enable(module_id)

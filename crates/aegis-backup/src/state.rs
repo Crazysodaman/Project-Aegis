@@ -346,7 +346,7 @@ fn heartbeat_is_fresh(path: &Path, metadata: &fs::Metadata) -> Result<bool, Back
     }
 }
 
-fn ownership_failure(core_uuid: &str, detail: &str) -> BackupError {
+pub(crate) fn ownership_failure(core_uuid: &str, detail: &str) -> BackupError {
     BackupError::IntegrityFailed {
         core_uuid: core_uuid.to_owned(),
         status: IntegrityStatus::OwnershipMismatch,
@@ -354,7 +354,7 @@ fn ownership_failure(core_uuid: &str, detail: &str) -> BackupError {
     }
 }
 
-fn table_exists(connection: &Connection, name: &str) -> Result<bool, BackupError> {
+pub(crate) fn table_exists(connection: &Connection, name: &str) -> Result<bool, BackupError> {
     let exists: Option<i64> = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -363,4 +363,44 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool, BackupError
         )
         .optional()?;
     Ok(exists.is_some())
+}
+
+pub(crate) fn column_exists(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, BackupError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read `database_instance_uuid` from a Core database when the column exists.
+pub(crate) fn read_core_instance_uuid(database_path: &Path) -> Result<Option<String>, BackupError> {
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    read_core_instance_uuid_with(&connection)
+}
+
+pub(crate) fn read_core_instance_uuid_with(
+    connection: &Connection,
+) -> Result<Option<String>, BackupError> {
+    if !table_exists(connection, CORE_IDENTITY_TABLE)?
+        || !column_exists(connection, CORE_IDENTITY_TABLE, "database_instance_uuid")?
+    {
+        return Ok(None);
+    }
+    let instance = connection
+        .query_row(
+            "SELECT database_instance_uuid FROM core_identity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(instance)
 }

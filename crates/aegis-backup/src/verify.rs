@@ -4,10 +4,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::BackupError;
-use crate::manifest::{validate_manifest, BackupFile, BackupManifest, BACKUP_MANIFEST_FILE};
+use crate::manifest::{
+    validate_manifest, BackupFile, BackupManifest, BACKUP_MANIFEST_FILE, CORE_DATABASE_FILE,
+};
 use crate::pathutil::{
     absolute_path, ensure_no_redirects, hash_file, is_redirected, validate_relative_path,
 };
+use crate::percore::verify_database_ownership;
 use crate::state::{read_core_identity, verify_core_files};
 
 /// Overall result of verifying a backup directory.
@@ -234,6 +237,25 @@ pub fn verify_backup(destination: impl AsRef<Path>) -> Result<BackupVerification
                 Some(core.database_relative_path.clone()),
                 error.to_string(),
             )),
+        }
+
+        for database in &core.databases {
+            if database.file_name == CORE_DATABASE_FILE {
+                continue;
+            }
+            if !healthy.contains(&database.relative_path) {
+                continue;
+            }
+            let path = destination.join(&database.relative_path);
+            if let Err(error) =
+                verify_database_ownership(&core.core_uuid, &path, &database.ownership_table)
+            {
+                issues.push(VerificationIssue::new(
+                    VerificationIssueKind::Integrity,
+                    Some(database.relative_path.clone()),
+                    error.to_string(),
+                ));
+            }
         }
     }
 

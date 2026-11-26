@@ -606,6 +606,26 @@ impl CoreMemoryStore {
         }
     }
 
+    /// Fetch entries whose `source` exactly matches the supplied key.
+    ///
+    /// Archived and soft-deleted entries are included so callers can use this
+    /// for stable-key idempotency checks without creating duplicates. Results
+    /// are ordered oldest first.
+    pub fn find_by_source(&self, source: &str) -> Result<Vec<MemoryEntry>, SdkError> {
+        validate_bounded(source, MAX_SOURCE_CHARS, "source is too long")?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM memory_entries
+             WHERE core_uuid = ?1 AND source = ?2
+             ORDER BY created_at ASC, id ASC"
+        ))?;
+        let mut rows = statement.query(params![self.core_uuid, source])?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next()? {
+            entries.push(read_raw(row)?.into_entry(&self.core_uuid)?);
+        }
+        Ok(entries)
+    }
+
     /// Search entries by case-insensitive text (content or tags) and kind.
     pub fn search(&self, query: &MemoryQuery) -> Result<Vec<MemoryEntry>, SdkError> {
         query.validate()?;

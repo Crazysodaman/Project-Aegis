@@ -5,8 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use aegis_fleet::{
-    fleet_store, FleetError, FleetStore, GpuPolicy, GpuProbe, GpuTelemetry, HostRole,
-    NvidiaSmiProbe, GPU_TELEMETRY_SCHEMA,
+    evaluate_deployment_readiness, fleet_store, DeploymentInput, EndpointClass, FleetError,
+    FleetStore, GpuPolicy, GpuProbe, GpuTelemetry, HostCapabilities, HostRole, NvidiaSmiProbe,
+    TransportPolicy, DEFAULT_HOST_STALE_AFTER_SECONDS, GPU_TELEMETRY_SCHEMA,
 };
 use aegis_platform::PlatformService;
 
@@ -280,6 +281,181 @@ fn gpu_policy_and_admission_are_owner_gated() {
     assert_eq!(updated.max_utilization_percent, 90);
     let admit = store.admission(&telemetry).expect("admission");
     assert!(admit.admit, "reasons: {:?}", admit.reasons);
+}
+
+#[test]
+fn host_capabilities_validate_and_round_trip() {
+    let inference =
+        HostCapabilities::new([HostRole::Inference], ["ollama", "gpu"]).expect("inference caps");
+    assert!(inference.supports_inference());
+    let value = inference.to_value().expect("value");
+    assert_eq!(
+        HostCapabilities::from_value(&value).expect("round trip"),
+        inference
+    );
+
+    let general =
+        HostCapabilities::new([HostRole::General], ["smb", "winrm"]).expect("general caps");
+    assert!(!general.supports_inference());
+    let general_value = general.to_value().expect("value");
+    assert_eq!(general_value["inference"], serde_json::json!(false));
+
+    assert!(HostCapabilities::new([], ["gpu"]).is_err());
+    assert!(HostCapabilities::new([HostRole::General], ["inference"]).is_err());
+    assert!(HostCapabilities::from_value(&serde_json::json!({
+        "roles": ["general"],
+        "capabilities": ["smb"],
+        "inference": true,
+    }))
+    .is_err());
+
+    let (_temp, root, token) = setup();
+    let store = store(&root);
+    let host = store
+        .add_host(
+            "Artemis",
+            "http://192.168.1.55:11434",
+            HostRole::General,
+            general_value,
+            50,
+            &token,
+        )
+        .expect("host");
+    assert_eq!(host.capabilities["inference"], serde_json::json!(false));
+}
+
+#[test]
+fn stale_hosts_are_excluded_from_placement_and_summary() {
+    let (_temp, root, token) = setup();
+    let store = store(&root);
+    let (endpoint, server) = mock_ollama(2);
+    let host = store
+        .add_host(
+            "Venus",
+            &endpoint,
+            HostRole::Inference,
+            serde_json::Value::Null,
+            80,
+            &token,
+        )
+        .expect("host");
+    store.enroll(&host.host_id, &token).expect("enroll");
+    let probed = store.probe(&host.host_id).expect("probe");
+    let health = probed.health.expect("health");
+    assert!(health.is_fresh(&health.checked_at, 0));
+    assert_eq!(store.placements().expect("placements").len(), 1);
+
+    let summary = store.host_summary().expect("summary");
+    assert_eq!(summary.total, 1);
+    assert_eq!(summary.enrolled, 1);
+    assert_eq!(summary.trusted, 1);
+    assert_eq!(summary.healthy, 1);
+    assert_eq!(summary.stale, 0);
+    assert_eq!(summary.never_probed, 0);
+    assert_eq!(summary.eligible, 1);
+
+    let future = "2999-01-01T00:00:00Z";
+    assert!(health.is_stale(future, DEFAULT_HOST_STALE_AFTER_SECONDS));
+    let stale_summary = store
+        .host_summary_at(future, DEFAULT_HOST_STALE_AFTER_SECONDS)
+        .expect("stale summary");
+    assert_eq!(stale_summary.stale, 1);
+    assert_eq!(stale_summary.healthy, 0);
+    assert_eq!(stale_summary.eligible, 0);
+    assert!(stale_summary.hosts[0].last_probe_age_seconds.is_some());
+    assert!(store
+        .placements_at(future, DEFAULT_HOST_STALE_AFTER_SECONDS)
+        .expect("stale placements")
+        .is_empty());
+    server.join().expect("server");
+}
+
+#[test]
+fn unenrolled_host_is_never_eligible() {
+    let (_temp, root, token) = setup();
+    let store = store(&root);
+    let host = store
+        .add_host(
+            "Draft",
+            "http://127.0.0.1:11434",
+            HostRole::General,
+            serde_json::Value::Null,
+            50,
+            &token,
+        )
+        .expect("host");
+    let summary = store.host_summary().expect("summary");
+    assert_eq!(summary.total, 1);
+    assert_eq!(summary.enrolled, 0);
+    assert_eq!(summary.trusted, 0);
+    assert_eq!(summary.never_probed, 1);
+    assert_eq!(summary.eligible, 0);
+    assert_eq!(summary.hosts[0].host_id, host.host_id);
+}
+
+#[test]
+fn deployment_readiness_reflects_stored_capabilities_and_transport() {
+    let (_temp, root, token) = setup();
+    let store = store(&root);
+
+    let general = HostCapabilities::new([HostRole::General], ["smb"]).expect("general caps");
+    let host = store
+        .add_host(
+            "Artemis",
+            "http://192.168.1.55:11434",
+            HostRole::General,
+            general.to_value().expect("value"),
+            50,
+            &token,
+        )
+        .expect("host");
+    store.enroll(&host.host_id, &token).expect("enroll");
+    let stored = store.host(&host.host_id).expect("stored host");
+
+    let readiness = evaluate_deployment_readiness(&DeploymentInput {
+        callsign: "Artemis",
+        host: Some(&stored),
+        transport_policy: TransportPolicy::strict(),
+        secret_provisioned: true,
+    });
+    assert!(readiness.ready, "blockers: {:?}", readiness.blockers);
+    assert!(readiness.capabilities_valid);
+    assert!(!readiness.declares_inference);
+    assert_eq!(readiness.endpoint_class, Some(EndpointClass::PrivateLan));
+    assert!(readiness.transport_accepted);
+
+    let inference = HostCapabilities::new([HostRole::Inference], ["ollama"]).expect("caps");
+    let inference_host = store
+        .add_host(
+            "Venus",
+            "http://127.0.0.1:11434",
+            HostRole::Inference,
+            inference.to_value().expect("value"),
+            80,
+            &token,
+        )
+        .expect("host");
+    store
+        .enroll(&inference_host.host_id, &token)
+        .expect("enroll");
+    let stored_inference = store.host(&inference_host.host_id).expect("stored host");
+
+    let inference_readiness = evaluate_deployment_readiness(&DeploymentInput {
+        callsign: "Venus",
+        host: Some(&stored_inference),
+        transport_policy: TransportPolicy::strict(),
+        secret_provisioned: true,
+    });
+    assert!(
+        inference_readiness.ready,
+        "blockers: {:?}",
+        inference_readiness.blockers
+    );
+    assert!(inference_readiness.declares_inference);
+    assert_eq!(
+        inference_readiness.endpoint_class,
+        Some(EndpointClass::Loopback)
+    );
 }
 
 #[test]

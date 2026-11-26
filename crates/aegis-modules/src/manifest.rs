@@ -144,7 +144,75 @@ pub struct ModulePermission {
 #[serde(deny_unknown_fields)]
 pub struct ModuleDependency {
     pub module_id: String,
+    /// Optional semver-style requirement (`^`, `~`, `>=`, `<=`, `>`, `<`, `=`).
     pub version_requirement: Option<String>,
+    /// Optional inclusive lower bound, as a plain `major.minor.patch` version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    /// Optional inclusive upper bound, as a plain `major.minor.patch` version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_version: Option<String>,
+}
+
+impl ModuleDependency {
+    /// Whether any version constraint is declared for this dependency.
+    pub fn has_version_constraint(&self) -> bool {
+        self.version_requirement.is_some()
+            || self.min_version.is_some()
+            || self.max_version.is_some()
+    }
+
+    /// Whether `version` satisfies every declared constraint.
+    ///
+    /// The `version_requirement` form (when present) and the optional inclusive
+    /// `min_version`/`max_version` bounds are all applied. A malformed version
+    /// or bound never satisfies a dependency (fail-closed).
+    pub fn version_matches(&self, version: &str) -> bool {
+        if let Some(requirement) = &self.version_requirement {
+            if !version_satisfies(requirement, version) {
+                return false;
+            }
+        }
+        let Some(actual) = parse_version(version) else {
+            return false;
+        };
+        if let Some(min) = &self.min_version {
+            let Some(min) = parse_version(min) else {
+                return false;
+            };
+            if actual < min {
+                return false;
+            }
+        }
+        if let Some(max) = &self.max_version {
+            let Some(max) = parse_version(max) else {
+                return false;
+            };
+            if actual > max {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Human-readable description of the declared constraints.
+    pub fn version_expectation(&self) -> String {
+        let mut constraints = Vec::new();
+        if let Some(requirement) = &self.version_requirement {
+            constraints.push(requirement.clone());
+        }
+        if let Some(min) = &self.min_version {
+            constraints.push(format!(">={min}"));
+        }
+        if let Some(max) = &self.max_version {
+            constraints.push(format!("<={max}"));
+        }
+        if constraints.is_empty() {
+            "*".to_owned()
+        } else {
+            constraints.join(", ")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +445,32 @@ impl ModuleManifest {
                 if !is_version_requirement(requirement) {
                     return Err(ManifestError::InvalidDependency(format!(
                         "invalid version requirement for {}",
+                        dependency.module_id
+                    )));
+                }
+            }
+            let min = match &dependency.min_version {
+                Some(raw) => Some(parse_version(raw).ok_or_else(|| {
+                    ManifestError::InvalidDependency(format!(
+                        "invalid minimum version for {}",
+                        dependency.module_id
+                    ))
+                })?),
+                None => None,
+            };
+            let max = match &dependency.max_version {
+                Some(raw) => Some(parse_version(raw).ok_or_else(|| {
+                    ManifestError::InvalidDependency(format!(
+                        "invalid maximum version for {}",
+                        dependency.module_id
+                    ))
+                })?),
+                None => None,
+            };
+            if let (Some(min), Some(max)) = (min, max) {
+                if min > max {
+                    return Err(ManifestError::InvalidDependency(format!(
+                        "minimum version exceeds maximum version for {}",
                         dependency.module_id
                     )));
                 }
@@ -789,6 +883,75 @@ mod tests {
         assert!(matches!(
             manifest.validate_structure(),
             Err(ManifestError::DuplicateTool(_))
+        ));
+    }
+
+    #[test]
+    fn dependency_min_and_max_versions_are_enforced() {
+        let dependency = ModuleDependency {
+            module_id: "com.example.dep".to_owned(),
+            version_requirement: None,
+            min_version: Some("1.2.0".to_owned()),
+            max_version: Some("1.4.9".to_owned()),
+        };
+        assert!(dependency.has_version_constraint());
+        assert!(dependency.version_matches("1.2.0"));
+        assert!(dependency.version_matches("1.3.5"));
+        assert!(dependency.version_matches("1.4.9"));
+        assert!(!dependency.version_matches("1.1.9"));
+        assert!(!dependency.version_matches("1.5.0"));
+        assert!(!dependency.version_matches("not-a-version"));
+        assert_eq!(dependency.version_expectation(), ">=1.2.0, <=1.4.9");
+
+        let minimum_only = ModuleDependency {
+            module_id: "com.example.dep".to_owned(),
+            version_requirement: Some("^1.2.0".to_owned()),
+            min_version: Some("1.2.3".to_owned()),
+            max_version: None,
+        };
+        assert!(minimum_only.version_matches("1.2.3"));
+        assert!(!minimum_only.version_matches("1.2.0"));
+        assert!(!minimum_only.version_matches("2.0.0"));
+
+        let unconstrained = ModuleDependency {
+            module_id: "com.example.dep".to_owned(),
+            version_requirement: None,
+            min_version: None,
+            max_version: None,
+        };
+        assert!(!unconstrained.has_version_constraint());
+        assert!(unconstrained.version_matches("9.9.9"));
+        assert_eq!(unconstrained.version_expectation(), "*");
+    }
+
+    #[test]
+    fn invalid_dependency_version_bounds_are_rejected() {
+        let mut manifest: ModuleManifest =
+            serde_json::from_str(include_str!("../examples/hello.manifest.json"))
+                .expect("example manifest");
+        manifest.dependencies = vec![ModuleDependency {
+            module_id: "com.example.dep".to_owned(),
+            version_requirement: None,
+            min_version: Some("2.0.0".to_owned()),
+            max_version: Some("1.0.0".to_owned()),
+        }];
+        assert!(matches!(
+            manifest.validate_structure(),
+            Err(ManifestError::InvalidDependency(_))
+        ));
+
+        manifest.dependencies[0].min_version = Some("not-a-version".to_owned());
+        manifest.dependencies[0].max_version = None;
+        assert!(matches!(
+            manifest.validate_structure(),
+            Err(ManifestError::InvalidDependency(_))
+        ));
+
+        manifest.dependencies[0].min_version = None;
+        manifest.dependencies[0].max_version = Some("1.0".to_owned());
+        assert!(matches!(
+            manifest.validate_structure(),
+            Err(ManifestError::InvalidDependency(_))
         ));
     }
 

@@ -772,10 +772,7 @@ fn fleet_enrollment_requires_owner_and_policy_persists() {
         &root_arg(&root),
     ]);
     assert_eq!(supervision["schema"], "aegis.cli.gpu_supervision_run.v1");
-    assert_eq!(
-        supervision["reports"].as_array().expect("reports").len(),
-        1
-    );
+    assert_eq!(supervision["reports"].as_array().expect("reports").len(), 1);
 }
 
 #[test]

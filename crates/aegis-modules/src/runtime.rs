@@ -15,8 +15,12 @@
 //!   live process.
 //!
 //! Modules are trusted local code. The runtime provides lifecycle supervision,
-//! timeouts, forced termination, and secret-free environment isolation; it is
-//! not an operating-system sandbox.
+//! timeouts, forced termination, secret-free environment isolation, and
+//! [`crate::policy::ExecutionPolicy`] runtime/IO/tool budgets (including the
+//! restricted-module opt-in). On Windows a forced stop uses `taskkill /T /F` to
+//! terminate the module's process tree. It is **not** an operating-system
+//! sandbox: Windows Job Objects / AppContainer and Linux namespaces / seccomp /
+//! cgroups are not used. See [`crate::sandbox::IsolationSupport::probe`].
 
 use std::fs;
 use std::io::ErrorKind;
@@ -35,10 +39,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::manifest::{validate_module_id, ModuleManifest};
+use crate::policy::{ExecutionPolicy, ModuleTrust, PolicyError, MAX_POLICY_RUNTIME_MS};
 use crate::registry::{ModuleError, ModuleLifecycleState, ModuleRegistry};
 
 /// Schema identifier for a module runtime status document.
 pub const MODULE_RUNTIME_SCHEMA: &str = "aegis.module.runtime.v1";
+/// Schema identifier for an aggregated execution audit summary.
+pub const MODULE_EXECUTION_AUDIT_SCHEMA: &str = "aegis.module.execution_audit.v1";
 /// How long to wait for the first fresh heartbeat after spawning.
 pub const MODULE_START_TIMEOUT_MS: u64 = 5_000;
 /// How long to wait for a graceful stop before forced termination.
@@ -115,6 +122,236 @@ impl ModuleRuntimeStatus {
     }
 }
 
+/// The most recent recorded execution error across all modules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleAuditError {
+    pub module_id: String,
+    pub state: ModuleRuntimeState,
+    pub occurred_at: Option<String>,
+    pub message: String,
+}
+
+/// Derived exit/outcome classification for one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleExitOutcome {
+    /// No runtime row has ever been recorded.
+    NotStarted,
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+    Stale,
+}
+
+impl ModuleExitOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn from_runtime(state: ModuleRuntimeState, has_started: bool) -> Self {
+        match state {
+            ModuleRuntimeState::Starting => Self::Starting,
+            ModuleRuntimeState::Running => Self::Running,
+            ModuleRuntimeState::Stopping => Self::Stopped,
+            ModuleRuntimeState::Stopped => {
+                if has_started {
+                    Self::Stopped
+                } else {
+                    Self::NotStarted
+                }
+            }
+            ModuleRuntimeState::Failed => Self::Failed,
+            ModuleRuntimeState::Stale => Self::Stale,
+        }
+    }
+
+    /// Outcome bucket used by the audit (running vs. not running).
+    pub const fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// Outcome bucket used by the audit (failed vs. not failed).
+    pub const fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+/// Per-module audit row: trust, applied limits, denial reason, and outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleAuditEntry {
+    pub module_id: String,
+    pub lifecycle_state: String,
+    pub state: ModuleRuntimeState,
+    pub exit_outcome: ModuleExitOutcome,
+    pub trust: ModuleTrust,
+    pub policy: ExecutionPolicy,
+    /// Why execution is currently denied, if it is. Derived from lifecycle and
+    /// policy; nothing here is inferred or persisted as a trust claim.
+    pub denied_reason: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Aggregated, read-only execution audit for UI/TUI and operator status.
+///
+/// Counts are derived from the effective runtime status of each registered
+/// module. Heartbeat freshness is aggregated into fresh, stale, and missing
+/// buckets; no registry row is treated as proof of a live process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleExecutionAudit {
+    pub schema: String,
+    pub generated_at: String,
+    /// Policy applied to every module in this audit projection.
+    pub policy: ExecutionPolicy,
+    pub module_count: u64,
+    pub enabled_count: u64,
+    pub running_count: u64,
+    pub running_modules: Vec<String>,
+    pub starting_count: u64,
+    pub stale_count: u64,
+    pub failed_count: u64,
+    pub stopped_count: u64,
+    pub restricted_count: u64,
+    pub denied_count: u64,
+    pub denied_modules: Vec<String>,
+    pub entries: Vec<ModuleAuditEntry>,
+    pub heartbeat_fresh_count: u64,
+    pub heartbeat_stale_count: u64,
+    pub heartbeat_missing_count: u64,
+    pub oldest_heartbeat_age_ms: Option<i64>,
+    pub freshest_heartbeat_age_ms: Option<i64>,
+    pub last_error: Option<ModuleAuditError>,
+}
+
+impl ModuleExecutionAudit {
+    fn from_statuses(
+        statuses: Vec<ModuleRuntimeStatus>,
+        generated_at: String,
+        policy: &ExecutionPolicy,
+    ) -> Self {
+        let module_count = statuses.len() as u64;
+        let mut audit = Self {
+            schema: MODULE_EXECUTION_AUDIT_SCHEMA.to_owned(),
+            generated_at,
+            policy: policy.clone(),
+            module_count,
+            enabled_count: 0,
+            running_count: 0,
+            running_modules: Vec::new(),
+            starting_count: 0,
+            stale_count: 0,
+            failed_count: 0,
+            stopped_count: 0,
+            restricted_count: 0,
+            denied_count: 0,
+            denied_modules: Vec::new(),
+            entries: Vec::with_capacity(statuses.len()),
+            heartbeat_fresh_count: 0,
+            heartbeat_stale_count: 0,
+            heartbeat_missing_count: 0,
+            oldest_heartbeat_age_ms: None,
+            freshest_heartbeat_age_ms: None,
+            last_error: None,
+        };
+        let mut last_error_order: Option<(String, String)> = None;
+        for status in statuses {
+            if status.lifecycle_state == ModuleLifecycleState::Enabled.as_str() {
+                audit.enabled_count += 1;
+            }
+            match status.state {
+                ModuleRuntimeState::Running => {
+                    audit.running_count += 1;
+                    audit.running_modules.push(status.module_id.clone());
+                }
+                ModuleRuntimeState::Starting => audit.starting_count += 1,
+                ModuleRuntimeState::Stale => audit.stale_count += 1,
+                ModuleRuntimeState::Failed => audit.failed_count += 1,
+                ModuleRuntimeState::Stopped | ModuleRuntimeState::Stopping => {
+                    audit.stopped_count += 1;
+                }
+            }
+            if status.heartbeat_fresh {
+                audit.heartbeat_fresh_count += 1;
+            } else if status.heartbeat_at.is_some() {
+                audit.heartbeat_stale_count += 1;
+            } else {
+                audit.heartbeat_missing_count += 1;
+            }
+            if let Some(age) = status.heartbeat_age_ms {
+                audit.oldest_heartbeat_age_ms = Some(
+                    audit
+                        .oldest_heartbeat_age_ms
+                        .map_or(age, |current| current.max(age)),
+                );
+                audit.freshest_heartbeat_age_ms = Some(
+                    audit
+                        .freshest_heartbeat_age_ms
+                        .map_or(age, |current| current.min(age)),
+                );
+            }
+            if policy.trust.is_restricted() {
+                audit.restricted_count += 1;
+            }
+            let denied_reason = denied_reason(&status.lifecycle_state, policy);
+            if denied_reason.is_some() {
+                audit.denied_count += 1;
+                audit.denied_modules.push(status.module_id.clone());
+            }
+            audit.entries.push(ModuleAuditEntry {
+                module_id: status.module_id.clone(),
+                lifecycle_state: status.lifecycle_state.clone(),
+                state: status.state,
+                exit_outcome: ModuleExitOutcome::from_runtime(
+                    status.state,
+                    status.started_at.is_some(),
+                ),
+                trust: policy.trust,
+                policy: policy.clone(),
+                denied_reason,
+                last_error: status.last_error.clone(),
+            });
+            if let Some(message) = &status.last_error {
+                let order = (
+                    status.updated_at.clone().unwrap_or_default(),
+                    status.module_id.clone(),
+                );
+                let is_newer = last_error_order
+                    .as_ref()
+                    .is_none_or(|current| order >= *current);
+                if is_newer {
+                    last_error_order = Some(order);
+                    audit.last_error = Some(ModuleAuditError {
+                        module_id: status.module_id,
+                        state: status.state,
+                        occurred_at: status.updated_at,
+                        message: message.clone(),
+                    });
+                }
+            }
+        }
+        audit
+    }
+}
+
+fn denied_reason(lifecycle_state: &str, policy: &ExecutionPolicy) -> Option<String> {
+    if lifecycle_state != ModuleLifecycleState::Enabled.as_str() {
+        return Some(format!(
+            "module is {lifecycle_state}; enable it before execution"
+        ));
+    }
+    if !policy.permits_restricted() {
+        return Some("restricted module requires an explicit allow_restricted policy".to_owned());
+    }
+    None
+}
+
 #[derive(Debug, Error)]
 pub enum ModuleRuntimeError {
     #[error("module runtime storage failed: {0}")]
@@ -137,8 +374,22 @@ pub enum ModuleRuntimeError {
     StopActive,
     #[error("module {module_id} is {state}; enable it before starting")]
     NotEnabled { module_id: String, state: String },
+    #[error("module execution policy is invalid: {0}")]
+    Policy(#[from] PolicyError),
+    #[error("module {module_id} is restricted; an explicit allow_restricted policy is required")]
+    RestrictedDenied { module_id: String },
+    #[error("module {module_id} declares {declared} tools but the policy allows {allowed}")]
+    ToolCountExceeded {
+        module_id: String,
+        declared: usize,
+        allowed: usize,
+    },
     #[error("module {0} is already running")]
     AlreadyRunning(String),
+    #[error(
+        "module {module_id} is {state}; only a failed, stale, or stopped module can be recovered"
+    )]
+    NotRecoverable { module_id: String, state: String },
     #[error("module {module_id} entrypoint kind {kind} is not executable by this runtime")]
     UnsupportedEntrypoint { module_id: String, kind: String },
     #[error("module {module_id} entrypoint is missing: {path}")]
@@ -181,11 +432,34 @@ impl ModuleRuntime {
     }
 
     /// Start an enabled module and wait until it reports a fresh heartbeat.
+    ///
+    /// Uses the default `trusted_local` [`ExecutionPolicy`].
     pub fn start(
         &self,
         module_id: &str,
         owner_token: &str,
     ) -> Result<ModuleRuntimeStatus, ModuleRuntimeError> {
+        self.start_with_policy(module_id, owner_token, &ExecutionPolicy::default())
+    }
+
+    /// Start an enabled module under an explicit trust/limits policy.
+    ///
+    /// The policy is validated and a `restricted` module is denied unless the
+    /// policy sets `allow_restricted`. When `max_runtime_ms` is tighter than the
+    /// framework cap, a supervisor watchdog writes the stop sentinel and then
+    /// terminates the process if it outlives the policy budget.
+    pub fn start_with_policy(
+        &self,
+        module_id: &str,
+        owner_token: &str,
+        policy: &ExecutionPolicy,
+    ) -> Result<ModuleRuntimeStatus, ModuleRuntimeError> {
+        policy.validate()?;
+        if policy.trust == ModuleTrust::Restricted && !policy.allow_restricted {
+            return Err(ModuleRuntimeError::RestrictedDenied {
+                module_id: module_id.to_owned(),
+            });
+        }
         self.authorize(owner_token)?;
         validate_module_id(module_id).map_err(ModuleError::from)?;
         if self.safe.stop_status()?.active {
@@ -197,6 +471,13 @@ impl ModuleRuntime {
             return Err(ModuleRuntimeError::NotEnabled {
                 module_id: module_id.to_owned(),
                 state: inspection.record.lifecycle_state.as_str().to_owned(),
+            });
+        }
+        if inspection.manifest.tools.len() > policy.max_tool_count {
+            return Err(ModuleRuntimeError::ToolCountExceeded {
+                module_id: module_id.to_owned(),
+                declared: inspection.manifest.tools.len(),
+                allowed: policy.max_tool_count,
             });
         }
         if !matches!(
@@ -307,6 +588,13 @@ impl ModuleRuntime {
                     module_id,
                     inspection.record.lifecycle_state.as_str(),
                 );
+                spawn_runtime_watchdog(
+                    self.clone(),
+                    module_id.to_owned(),
+                    control.clone(),
+                    pid,
+                    policy.max_runtime_ms,
+                );
                 reap_in_background(child);
                 return Ok(status);
             }
@@ -408,6 +696,69 @@ impl ModuleRuntime {
         self.start(module_id, owner_token)
     }
 
+    /// Recover a crashed or stale module after an explicit owner action.
+    ///
+    /// Recovery is deliberately separate from [`Self::restart`]. It requires
+    /// owner proof, an `enabled` lifecycle state (the owner must have enabled the
+    /// module first), and a non-live runtime state (`failed`, `stale`, or
+    /// `stopped`). A running or starting module is rejected. Any lingering
+    /// process is terminated through the normal stop path before a fresh start.
+    ///
+    /// This is lifecycle recovery only: it does not reinstall, re-verify, or
+    /// re-enable a module, and it does not bypass any authorization check.
+    pub fn recover(
+        &self,
+        module_id: &str,
+        owner_token: &str,
+    ) -> Result<ModuleRuntimeStatus, ModuleRuntimeError> {
+        self.recover_with_policy(module_id, owner_token, &ExecutionPolicy::default())
+    }
+
+    /// Recover a module under an explicit trust/limits policy.
+    pub fn recover_with_policy(
+        &self,
+        module_id: &str,
+        owner_token: &str,
+        policy: &ExecutionPolicy,
+    ) -> Result<ModuleRuntimeStatus, ModuleRuntimeError> {
+        policy.validate()?;
+        if policy.trust == ModuleTrust::Restricted && !policy.allow_restricted {
+            return Err(ModuleRuntimeError::RestrictedDenied {
+                module_id: module_id.to_owned(),
+            });
+        }
+        self.authorize(owner_token)?;
+        validate_module_id(module_id).map_err(ModuleError::from)?;
+        if self.safe.stop_status()?.active {
+            return Err(ModuleRuntimeError::StopActive);
+        }
+        let inspection = self.registry.inspect(module_id)?;
+        if inspection.record.lifecycle_state != ModuleLifecycleState::Enabled {
+            return Err(ModuleRuntimeError::NotEnabled {
+                module_id: module_id.to_owned(),
+                state: inspection.record.lifecycle_state.as_str().to_owned(),
+            });
+        }
+        let status = self.status(module_id)?;
+        if matches!(
+            status.state,
+            ModuleRuntimeState::Running | ModuleRuntimeState::Starting
+        ) {
+            return Err(ModuleRuntimeError::AlreadyRunning(module_id.to_owned()));
+        }
+        if !matches!(
+            status.state,
+            ModuleRuntimeState::Failed | ModuleRuntimeState::Stale | ModuleRuntimeState::Stopped
+        ) {
+            return Err(ModuleRuntimeError::NotRecoverable {
+                module_id: module_id.to_owned(),
+                state: status.state.as_str().to_owned(),
+            });
+        }
+        self.stop(module_id, owner_token)?;
+        self.start_with_policy(module_id, owner_token, policy)
+    }
+
     /// Effective status derived from the recorded row, process liveness, and
     /// heartbeat freshness.
     pub fn status(&self, module_id: &str) -> Result<ModuleRuntimeStatus, ModuleRuntimeError> {
@@ -437,6 +788,33 @@ impl ModuleRuntime {
             ));
         }
         Ok(statuses)
+    }
+
+    /// Aggregated execution audit for every registered module.
+    ///
+    /// This is a read-only projection of [`Self::list`]: running modules, the
+    /// most recent error, heartbeat freshness buckets, the applied policy, and a
+    /// per-module denial reason/outcome. It never starts, stops, or otherwise
+    /// changes module state. Uses the default `trusted_local` policy.
+    pub fn execution_summary(&self) -> Result<ModuleExecutionAudit, ModuleRuntimeError> {
+        self.execution_summary_with_policy(&ExecutionPolicy::default())
+    }
+
+    /// Aggregated execution audit under an explicit trust/limits policy.
+    ///
+    /// The policy is validated before the read-only projection is built. No
+    /// module is started, stopped, or modified.
+    pub fn execution_summary_with_policy(
+        &self,
+        policy: &ExecutionPolicy,
+    ) -> Result<ModuleExecutionAudit, ModuleRuntimeError> {
+        policy.validate()?;
+        let statuses = self.list()?;
+        Ok(ModuleExecutionAudit::from_statuses(
+            statuses,
+            now_rfc3339()?,
+            policy,
+        ))
     }
 
     fn authorize(&self, owner_token: &str) -> Result<(), ModuleRuntimeError> {
@@ -769,6 +1147,53 @@ fn reap_in_background(mut child: Child) {
     });
 }
 
+/// Enforce a tightened `max_runtime_ms` for a running module.
+///
+/// The watchdog is only spawned when the policy is stricter than the framework
+/// cap, so the default policy spawns nothing. It requests a graceful stop via
+/// the sentinel, escalates to forced termination, and records a `failed` runtime
+/// row with an explicit policy reason. This is lifecycle enforcement, not an OS
+/// sandbox.
+fn spawn_runtime_watchdog(
+    runtime: ModuleRuntime,
+    module_id: String,
+    control: PathBuf,
+    pid: u32,
+    max_runtime_ms: u64,
+) {
+    if max_runtime_ms == 0 || max_runtime_ms >= MAX_POLICY_RUNTIME_MS {
+        return;
+    }
+    let sentinel = control.join(format!("{module_id}.stop"));
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(max_runtime_ms));
+        if !process_is_alive(pid) {
+            let _ = remove_if_exists(&sentinel);
+            return;
+        }
+        let _ = fs::write(&sentinel, b"stop");
+        let deadline = Instant::now() + Duration::from_millis(MODULE_STOP_TIMEOUT_MS);
+        while process_is_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+        if process_is_alive(pid) {
+            let _ = terminate_pid(pid);
+        }
+        if let Ok(connection) = runtime.open() {
+            let already_stopped = read_row(&connection, &module_id)
+                .is_ok_and(|row| row.is_some_and(|row| row.state == ModuleRuntimeState::Stopped));
+            if !already_stopped {
+                let _ = runtime.mark_failed(
+                    &connection,
+                    &module_id,
+                    "module exceeded its execution policy runtime limit",
+                );
+            }
+        }
+        let _ = remove_if_exists(&sentinel);
+    });
+}
+
 #[cfg(windows)]
 fn is_redirected(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -815,8 +1240,11 @@ pub fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn terminate_pid(pid: u32) -> Result<(), ModuleRuntimeError> {
+    // `/T` also terminates descendant processes started by the module and `/F`
+    // forces them down. This is process-tree cleanup, not an OS security
+    // sandbox: the child still runs with the Platform user's full rights.
     Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

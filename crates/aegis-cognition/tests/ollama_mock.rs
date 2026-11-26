@@ -497,3 +497,68 @@ fn live_ollama_smoke() {
     assert!(matches!(cancelled, Err(InferenceError::Cancelled)));
     assert!(observed > 0, "cancellation ran before any chunk arrived");
 }
+
+#[test]
+fn live_ollama_cancel_under_load_then_recovers() {
+    if std::env::var("AEGIS_OLLAMA_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("skipping live cancellation test: set AEGIS_OLLAMA_LIVE=1 to enable");
+        return;
+    }
+    let Ok(url) = std::env::var("AEGIS_OLLAMA_URL") else {
+        eprintln!("skipping live cancellation test: AEGIS_OLLAMA_URL is not set");
+        return;
+    };
+    let Ok(model) = std::env::var("AEGIS_OLLAMA_MODEL") else {
+        eprintln!("skipping live cancellation test: AEGIS_OLLAMA_MODEL is not set");
+        return;
+    };
+    let provider = OllamaProvider::new(url).expect("valid live URL");
+    let request = ChatRequest::new(
+        model,
+        vec![ChatMessage::user(
+            "Write a very long numbered list of facts about the ocean.",
+        )],
+    )
+    .with_max_tokens(2048)
+    .with_timeout_ms(120_000)
+    .with_think(Some(false));
+
+    let cancel = CancelToken::new();
+    let mut observed = 0usize;
+    let started = std::time::Instant::now();
+    let result = provider.chat_stream(&request, &cancel, &mut |chunk| {
+        if !chunk.delta.is_empty() {
+            observed += 1;
+            if observed >= 3 || started.elapsed() >= Duration::from_secs(2) {
+                cancel.cancel();
+            }
+        }
+        Ok(())
+    });
+    assert!(
+        matches!(result, Err(InferenceError::Cancelled)),
+        "expected cancellation, got {result:?}"
+    );
+    assert!(observed > 0, "cancellation ran before any chunk arrived");
+
+    // The provider must remain usable after an aborted generation.
+    let health = provider.health();
+    assert!(
+        health.reachable,
+        "provider unhealthy after cancel: {:?}",
+        health.error
+    );
+    let follow_up = provider
+        .chat(
+            &ChatRequest::new(
+                request.model.clone(),
+                vec![ChatMessage::user("Reply with the single word ok")],
+            )
+            .with_max_tokens(16)
+            .with_timeout_ms(120_000)
+            .with_think(Some(false)),
+            &CancelToken::new(),
+        )
+        .expect("follow-up chat after cancellation");
+    assert!(!follow_up.content.trim().is_empty());
+}

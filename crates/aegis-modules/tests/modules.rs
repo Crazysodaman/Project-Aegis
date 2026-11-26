@@ -201,6 +201,8 @@ fn missing_dependencies_are_rejected() {
     consumer.dependencies = vec![ModuleDependency {
         module_id: "com.example.dependency".to_owned(),
         version_requirement: Some("^0.1.0".to_owned()),
+        min_version: None,
+        max_version: None,
     }];
     let json = seal(&mut consumer);
     let error = registry
@@ -228,6 +230,8 @@ fn missing_dependencies_are_rejected() {
     second_consumer.dependencies = vec![ModuleDependency {
         module_id: "com.example.dependency".to_owned(),
         version_requirement: None,
+        min_version: None,
+        max_version: None,
     }];
     let json = seal(&mut second_consumer);
     let error = registry
@@ -564,8 +568,22 @@ fn module_mutations_require_owner_proof() {
     );
 
     manager
+        .check_enable("com.example.hello")
+        .expect("read-only enable precondition passes");
+    manager
+        .check_disable("com.example.hello")
+        .expect("read-only disable precondition passes");
+    manager
         .enable("com.example.hello", &token)
         .expect("authorized enable");
+    let error = manager
+        .check_enable("com.example.hello")
+        .expect_err("enabled module is not re-enableable");
+    assert!(matches!(
+        error,
+        ModuleError::IllegalTransition { ref from, ref to }
+            if from == "enabled" && to == "enabled"
+    ));
 }
 
 #[test]
@@ -582,6 +600,8 @@ fn dependency_version_requirements_block_install() {
     consumer.dependencies = vec![ModuleDependency {
         module_id: "com.example.dep".to_owned(),
         version_requirement: Some("^1.0.0".to_owned()),
+        min_version: None,
+        max_version: None,
     }];
     let json = seal(&mut consumer);
     let error = registry
@@ -598,11 +618,239 @@ fn dependency_version_requirements_block_install() {
     compatible.dependencies = vec![ModuleDependency {
         module_id: "com.example.dep".to_owned(),
         version_requirement: Some("^0.1.0".to_owned()),
+        min_version: None,
+        max_version: None,
     }];
     let json = seal(&mut compatible);
     registry
         .install(&json, None)
         .expect("compatible version installs");
+}
+
+fn dependency_consumer(module_id: &str, dependency_id: &str) -> (ModuleManifest, String) {
+    let mut consumer = example_manifest();
+    consumer.module_id = module_id.to_owned();
+    consumer.dependencies = vec![ModuleDependency {
+        module_id: dependency_id.to_owned(),
+        version_requirement: None,
+        min_version: None,
+        max_version: None,
+    }];
+    let json = seal(&mut consumer);
+    (consumer, json)
+}
+
+#[test]
+fn dependency_min_and_max_versions_are_enforced_on_install() {
+    let (_temp, paths) = temp_paths();
+    let registry = registry(&paths);
+    let (_dep, dep_json) = manifest_for("com.example.dep");
+    registry
+        .install(&dep_json, None)
+        .expect("install dependency");
+
+    let mut compatible = example_manifest();
+    compatible.module_id = "com.example.compatible".to_owned();
+    compatible.dependencies = vec![ModuleDependency {
+        module_id: "com.example.dep".to_owned(),
+        version_requirement: None,
+        min_version: Some("0.1.0".to_owned()),
+        max_version: Some("0.1.9".to_owned()),
+    }];
+    let json = seal(&mut compatible);
+    registry
+        .install(&json, None)
+        .expect("in-range dependency installs");
+
+    let mut too_new = example_manifest();
+    too_new.module_id = "com.example.too-new".to_owned();
+    too_new.dependencies = vec![ModuleDependency {
+        module_id: "com.example.dep".to_owned(),
+        version_requirement: None,
+        min_version: Some("1.0.0".to_owned()),
+        max_version: None,
+    }];
+    let json = seal(&mut too_new);
+    let error = registry
+        .install(&json, None)
+        .expect_err("dependency below its minimum must fail");
+    assert!(matches!(
+        error,
+        ModuleError::DependencyVersionMismatch { ref requirement, ref actual, .. }
+            if requirement.contains(">=1.0.0") && actual == "0.1.0"
+    ));
+
+    let mut too_old = example_manifest();
+    too_old.module_id = "com.example.too-old".to_owned();
+    too_old.dependencies = vec![ModuleDependency {
+        module_id: "com.example.dep".to_owned(),
+        version_requirement: None,
+        min_version: None,
+        max_version: Some("0.0.9".to_owned()),
+    }];
+    let json = seal(&mut too_old);
+    let error = registry
+        .install(&json, None)
+        .expect_err("dependency above its maximum must fail");
+    assert!(matches!(
+        error,
+        ModuleError::DependencyVersionMismatch { ref requirement, ref actual, .. }
+            if requirement.contains("<=0.0.9") && actual == "0.1.0"
+    ));
+
+    assert_eq!(registry.list().expect("list").len(), 2);
+}
+
+#[test]
+fn enable_and_disable_preconditions_are_read_only_and_dependency_aware() {
+    let (_temp, paths) = temp_paths();
+    let registry = registry(&paths);
+    let (_dep, dep_json) = manifest_for("com.example.dep");
+    registry.install(&dep_json, None).expect("install dep");
+    let (_consumer, consumer_json) = dependency_consumer("com.example.consumer", "com.example.dep");
+    registry
+        .install(&consumer_json, None)
+        .expect("install consumer");
+
+    registry
+        .check_enable("com.example.consumer")
+        .expect("enable precondition passes");
+    registry
+        .check_disable("com.example.consumer")
+        .expect("disable precondition passes while installed");
+    assert_eq!(
+        registry
+            .inspect("com.example.consumer")
+            .expect("inspect")
+            .record
+            .lifecycle_state,
+        ModuleLifecycleState::Installed
+    );
+
+    registry.enable("com.example.dep").expect("enable dep");
+    registry
+        .enable("com.example.consumer")
+        .expect("enable consumer");
+    let error = registry
+        .check_enable("com.example.consumer")
+        .expect_err("enabled module cannot be enabled again");
+    assert!(matches!(
+        error,
+        ModuleError::IllegalTransition { ref from, ref to }
+            if from == "enabled" && to == "enabled"
+    ));
+
+    let error = registry
+        .check_disable("com.example.dep")
+        .expect_err("cannot disable a provider with an enabled dependent");
+    assert!(matches!(
+        error,
+        ModuleError::DependencyInUse { ref module_id, ref dependent }
+            if module_id == "com.example.dep" && dependent == "com.example.consumer"
+    ));
+    let error = registry
+        .disable("com.example.dep")
+        .expect_err("disable must enforce the same precondition");
+    assert!(matches!(error, ModuleError::DependencyInUse { .. }));
+    assert_eq!(
+        registry
+            .inspect("com.example.dep")
+            .expect("inspect dep")
+            .record
+            .lifecycle_state,
+        ModuleLifecycleState::Enabled
+    );
+
+    registry
+        .check_disable("com.example.consumer")
+        .expect("consumer has no enabled dependents");
+    registry
+        .disable("com.example.consumer")
+        .expect("disable consumer");
+    registry
+        .check_disable("com.example.dep")
+        .expect("provider is now safe to disable");
+    registry.disable("com.example.dep").expect("disable dep");
+}
+
+#[test]
+fn enable_precondition_rejects_an_unavailable_dependency() {
+    let (_temp, paths) = temp_paths();
+    let registry = registry(&paths);
+    let (_dep, dep_json) = manifest_for("com.example.dep");
+    registry.install(&dep_json, None).expect("install dep");
+    let (_consumer, consumer_json) = dependency_consumer("com.example.consumer", "com.example.dep");
+    registry
+        .install(&consumer_json, None)
+        .expect("install consumer");
+    registry
+        .check_enable("com.example.consumer")
+        .expect("dependency is available");
+
+    registry
+        .uninstall("com.example.dep")
+        .expect("uninstall dependency");
+    let error = registry
+        .check_enable("com.example.consumer")
+        .expect_err("check must reject an unavailable dependency");
+    assert!(matches!(
+        error,
+        ModuleError::DependencyUnavailable { ref module_id, .. }
+            if module_id == "com.example.dep"
+    ));
+    let error = registry
+        .enable("com.example.consumer")
+        .expect_err("enable must reject an unavailable dependency");
+    assert!(matches!(
+        error,
+        ModuleError::DependencyUnavailable { ref module_id, .. }
+            if module_id == "com.example.dep"
+    ));
+    assert_eq!(
+        registry
+            .inspect("com.example.consumer")
+            .expect("inspect consumer")
+            .record
+            .lifecycle_state,
+        ModuleLifecycleState::Installed
+    );
+}
+
+#[test]
+fn invalid_dependency_version_bounds_are_rejected_on_install() {
+    let (_temp, paths) = temp_paths();
+    let registry = registry(&paths);
+    let (_dep, dep_json) = manifest_for("com.example.dep");
+    registry.install(&dep_json, None).expect("install dep");
+
+    let mut consumer = example_manifest();
+    consumer.module_id = "com.example.consumer".to_owned();
+    consumer.dependencies = vec![ModuleDependency {
+        module_id: "com.example.dep".to_owned(),
+        version_requirement: None,
+        min_version: Some("2.0.0".to_owned()),
+        max_version: Some("1.0.0".to_owned()),
+    }];
+    let json = seal(&mut consumer);
+    let error = registry
+        .install(&json, None)
+        .expect_err("inverted bounds must fail");
+    assert!(matches!(
+        error,
+        ModuleError::Manifest(ManifestError::InvalidDependency(_))
+    ));
+
+    consumer.dependencies[0].min_version = Some("nope".to_owned());
+    consumer.dependencies[0].max_version = None;
+    let json = seal(&mut consumer);
+    let error = registry
+        .install(&json, None)
+        .expect_err("malformed minimum must fail");
+    assert!(matches!(
+        error,
+        ModuleError::Manifest(ManifestError::InvalidDependency(_))
+    ));
+    assert_eq!(registry.list().expect("list").len(), 1);
 }
 
 #[test]
