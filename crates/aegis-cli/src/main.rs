@@ -1167,6 +1167,9 @@ fn command_living(args: &[String]) -> Result<(), String> {
     if matches!(group, "goal" | "task" | "autonomy") {
         return command_autonomy(root, args);
     }
+    if matches!(group, "preference" | "development") {
+        return command_development(root, args);
+    }
 
     require_owner_proof(root)?;
     let core = require_arg(args, "--core")?;
@@ -1594,6 +1597,104 @@ fn command_autonomy(root: &str, args: &[String]) -> Result<(), String> {
         "output": result.output,
         "detail": result.detail,
     }))
+}
+
+fn command_development(root: &str, args: &[String]) -> Result<(), String> {
+    require_owner_proof(root)?;
+    let core = require_arg(args, "--core")?;
+    let group = args.get(1).map(String::as_str).unwrap_or("preference");
+    let action = args.get(2).map(String::as_str).unwrap_or("list");
+    let executor =
+        ToolExecutor::new(PathBuf::from(root), core).map_err(|error| error.to_string())?;
+    let limit = parse_usize(args, "--limit", 50)?;
+    let optional = |name: &str| {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .unwrap_or(Value::Null)
+    };
+    let required = |name: &str| -> Result<Value, String> {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .ok_or_else(|| format!("missing required argument {name}"))
+    };
+    let number = |name: &str| -> Result<Value, String> {
+        let value = require_arg(args, name)?;
+        let number = value
+            .parse::<f64>()
+            .map_err(|_| format!("{name} must be a number"))?;
+        Ok(json!(number))
+    };
+    let (tool, arguments, approval) = match (group, action) {
+        ("preference", "record") => (
+            "preference.record",
+            json!({
+                "key": required("--key")?,
+                "valence": number("--valence")?,
+                "weight": number("--weight")?,
+                "source": optional("--source"),
+            }),
+            None,
+        ),
+        ("preference", "list") => ("preference.list", json!({"limit": limit}), None),
+        ("development", "reflect") => ("development.reflect", json!({}), None),
+        ("development", "propose") => (
+            "development.propose",
+            json!({
+                "rationale": required("--rationale")?,
+                "values": parse_tags(optional_arg(args, "--values")),
+                "traits": parse_float_map(optional_arg(args, "--traits"))?,
+            }),
+            None,
+        ),
+        ("development", "list") => ("development.list", json!({"limit": limit}), None),
+        ("development", "apply") => (
+            "development.apply",
+            json!({"proposal_id": required("--proposal-id")?}),
+            Some(owner_token(root)?),
+        ),
+        ("development", "reject") => (
+            "development.reject",
+            json!({"proposal_id": required("--proposal-id")?}),
+            Some(owner_token(root)?),
+        ),
+        ("development", "revert") => ("development.revert", json!({}), Some(owner_token(root)?)),
+        _ => return Err(format!("unknown development command: {group} {action}")),
+    };
+    let result = executor
+        .execute(tool, &arguments, approval.as_deref())
+        .map_err(|error| error.to_string())?;
+    print_json(&json!({
+        "schema": "aegis.cli.development.v1",
+        "tool": tool,
+        "status": result.status.as_str(),
+        "output": result.output,
+        "detail": result.detail,
+    }))
+}
+
+fn parse_float_map(value: Option<&str>) -> Result<Value, String> {
+    let mut map = serde_json::Map::new();
+    if let Some(value) = value {
+        for pair in value.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, raw) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("--traits entry must be key=value: {pair}"))?;
+            let key = key.trim();
+            if key.is_empty() {
+                return Err("--traits entry has an empty key".to_owned());
+            }
+            let number = raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("--traits value for {key} must be a number"))?;
+            map.insert(key.to_owned(), json!(number));
+        }
+    }
+    Ok(Value::Object(map))
 }
 
 fn command_personal(args: &[String]) -> Result<(), String> {
@@ -2692,6 +2793,11 @@ fn usage() {
          aegis living transfer offer|list|get|accept|reject|cancel|events --root <path> [options]\n\
          aegis living goal|task create|list|update|start|pause|resume|complete|cancel --root <path> --core <id> [options]\n\
          aegis living autonomy tick|settings|set-enabled --root <path> --core <id> [options]\n\
+         aegis living preference record --root <path> --core <id> --key <key> --valence <number> --weight <number> [--source <text>]\n\
+         aegis living preference list --root <path> --core <id> [--limit <n>]\n\
+         aegis living development reflect|list|revert --root <path> --core <id> [--limit <n>]\n\
+         aegis living development propose --root <path> --core <id> --rationale <text> [--values a,b] [--traits key=value,key=value]\n\
+         aegis living development apply|reject --root <path> --core <id> --proposal-id <id>\n\
          aegis voice synthesize --root <path> --core <core-id> --text <text> --out <wav> [--rate <percent>] [--volume <percent>]\n\
          aegis asset import <core-id> <kind> <file> --root <path> [--name <name>] [--media-type <type>] [--tags a,b]\n\
          aegis asset list <core-id> --root <path> [--kind <kind>] [--include-deleted]\n\

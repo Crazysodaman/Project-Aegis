@@ -192,6 +192,7 @@ dependencies = [
  "aegis-core-install",
  "aegis-core-storage",
  "aegis-platform",
+ "aegis-safe",
  "aegis-storage",
  "chrono",
  "rusqlite",

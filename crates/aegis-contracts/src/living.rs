@@ -7,6 +7,8 @@
 //! Persistence, permissions and execution live in the owning crates; these
 //! types only define shape and bounds so independent subsystems agree.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const LIVING_CONTRACT_VERSION: &str = "aegis.living.v1";
@@ -17,6 +19,11 @@ pub const MAX_DOCUMENT_BODY_CHARS: usize = 1024 * 1024;
 pub const MAX_TAGS: usize = 32;
 pub const MAX_TAG_CHARS: usize = 64;
 pub const MAX_LIST_ITEMS: usize = 256;
+pub const MAX_REFLECTION_SUMMARY_CHARS: usize = 2048;
+pub const MAX_PROPOSAL_RATIONALE_CHARS: usize = 2048;
+pub const MAX_PROPOSED_VALUES: usize = 64;
+pub const MAX_PROPOSED_VALUE_CHARS: usize = 256;
+pub const MAX_PROPOSED_TRAITS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -753,6 +760,143 @@ impl AutonomySettings {
     }
 }
 
+/// One learned preference with confidence and evidence provenance.
+///
+/// Values are descriptive only and never grant authorization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preference {
+    pub schema: String,
+    pub core_uuid: String,
+    pub key: String,
+    pub value: f32,
+    pub confidence: f32,
+    pub evidence_count: u64,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+impl Preference {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.core_uuid)
+            || !valid_id(&self.key)
+            || !self.value.is_finite()
+            || !(-1.0..=1.0).contains(&self.value)
+            || !self.confidence.is_finite()
+            || !(0.0..=1.0).contains(&self.confidence)
+            || !bounded(&self.updated_at, 64)
+            || self.revision == 0
+        {
+            return Err("invalid preference");
+        }
+        Ok(())
+    }
+}
+
+/// One bounded reflection synthesized from persisted preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reflection {
+    pub schema: String,
+    pub reflection_id: String,
+    pub core_uuid: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+impl Reflection {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.reflection_id)
+            || !valid_id(&self.core_uuid)
+            || self.summary.trim().is_empty()
+            || !bounded(&self.summary, MAX_REFLECTION_SUMMARY_CHARS)
+            || !bounded(&self.created_at, 64)
+        {
+            return Err("invalid reflection");
+        }
+        Ok(())
+    }
+}
+
+/// Lifecycle of a proposed personality change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalityProposalStatus {
+    Proposed,
+    Applied,
+    Rejected,
+}
+
+impl PersonalityProposalStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "proposed" => Self::Proposed,
+            "applied" => Self::Applied,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        })
+    }
+}
+
+/// A proposed personality change awaiting owner approval.
+///
+/// Proposals are expressive data only. Applying one never changes Core
+/// identity, the Constitution, or authorization inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersonalityProposal {
+    pub schema: String,
+    pub proposal_id: String,
+    pub core_uuid: String,
+    pub rationale: String,
+    pub proposed_values: Vec<String>,
+    pub proposed_traits: BTreeMap<String, f32>,
+    pub status: PersonalityProposalStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+impl PersonalityProposal {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.proposal_id)
+            || !valid_id(&self.core_uuid)
+            || self.rationale.trim().is_empty()
+            || !bounded(&self.rationale, MAX_PROPOSAL_RATIONALE_CHARS)
+            || self.proposed_values.len() > MAX_PROPOSED_VALUES
+            || self.proposed_traits.len() > MAX_PROPOSED_TRAITS
+            || !bounded(&self.created_at, 64)
+            || !bounded(&self.updated_at, 64)
+            || self.revision == 0
+        {
+            return Err("invalid personality proposal");
+        }
+        for value in &self.proposed_values {
+            if value.trim().is_empty() || !bounded(value, MAX_PROPOSED_VALUE_CHARS) {
+                return Err("invalid personality proposal");
+            }
+        }
+        for (name, value) in &self.proposed_traits {
+            if name.trim().is_empty()
+                || !bounded(name, MAX_TAG_CHARS)
+                || !value.is_finite()
+                || !(-1.0..=1.0).contains(value)
+            {
+                return Err("invalid personality proposal");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1051,107 @@ mod tests {
         assert!(bad.validate().is_err());
         let mut bad = settings;
         bad.max_active_tasks = 17;
+        assert!(bad.validate().is_err());
+    }
+
+    fn preference() -> Preference {
+        Preference {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            key: "music.jazz".to_owned(),
+            value: 0.5,
+            confidence: 0.7,
+            evidence_count: 3,
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 2,
+        }
+    }
+
+    #[test]
+    fn preferences_validate_bounds() {
+        assert!(preference().validate().is_ok());
+        let mut bad = preference();
+        bad.value = 1.5;
+        assert!(bad.validate().is_err());
+        let mut bad = preference();
+        bad.confidence = -0.1;
+        assert!(bad.validate().is_err());
+        let mut bad = preference();
+        bad.key.clear();
+        assert!(bad.validate().is_err());
+        let mut bad = preference();
+        bad.revision = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = preference();
+        bad.value = f32::NAN;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn reflections_validate_summary() {
+        let reflection = Reflection {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            reflection_id: "reflection-1".to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            summary: "I prefer quiet mornings.".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        assert!(reflection.validate().is_ok());
+        let mut bad = reflection.clone();
+        bad.summary.clear();
+        assert!(bad.validate().is_err());
+        let mut bad = reflection;
+        bad.reflection_id.clear();
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn personality_proposal_status_round_trips() {
+        for status in [
+            PersonalityProposalStatus::Proposed,
+            PersonalityProposalStatus::Applied,
+            PersonalityProposalStatus::Rejected,
+        ] {
+            assert_eq!(
+                PersonalityProposalStatus::parse(status.as_str()),
+                Some(status)
+            );
+        }
+        assert_eq!(PersonalityProposalStatus::parse("unknown"), None);
+    }
+
+    fn proposal() -> PersonalityProposal {
+        let mut traits = BTreeMap::new();
+        traits.insert("openness".to_owned(), 0.4_f32);
+        PersonalityProposal {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            proposal_id: "proposal-1".to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            rationale: "Growth from repeated experience.".to_owned(),
+            proposed_values: vec!["curiosity".to_owned()],
+            proposed_traits: traits,
+            status: PersonalityProposalStatus::Proposed,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn personality_proposals_validate() {
+        assert!(proposal().validate().is_ok());
+        let mut bad = proposal();
+        bad.rationale.clear();
+        assert!(bad.validate().is_err());
+        let mut bad = proposal();
+        bad.proposed_traits.insert("openness".to_owned(), 2.0_f32);
+        assert!(bad.validate().is_err());
+        let mut bad = proposal();
+        bad.proposed_values.clear();
+        bad.proposed_traits.clear();
+        assert!(bad.validate().is_ok());
+        let mut bad = proposal();
+        bad.revision = 0;
         assert!(bad.validate().is_err());
     }
 }

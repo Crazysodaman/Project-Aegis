@@ -8,6 +8,7 @@
 //! Every attempt is appended to the Safe audit chain. Argument *values* are
 //! never written to the audit record.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +22,7 @@ use aegis_core_sdk::possessions::{
 };
 use aegis_core_sdk::{
     AutonomyEngine, AutonomyStore, ConsentGrant, ConsentStore, CoreMemoryStore, CoreSdkContext,
-    Goal, MemoryKind, MemoryQuery, NewMemory, Task, TaskStatus,
+    DevelopmentStore, Goal, MemoryKind, MemoryQuery, NewMemory, Task, TaskStatus,
 };
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_modules::{
@@ -412,6 +413,70 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         sensitivity: ToolSensitivity::PersonalWrite,
         approval_required: false,
         input: "{ enabled: boolean, max_active_tasks?: number }",
+    },
+    ToolSpec {
+        name: "preference.record",
+        description: "Record preference evidence that updates one of this Core's preferences.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ key: string, valence: number, weight: number, source?: string }",
+    },
+    ToolSpec {
+        name: "preference.list",
+        description: "List this Core's learned preferences.",
+        permission: "development.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "development.reflect",
+        description: "Summarize this Core's strongest preferences into a stored reflection.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{}",
+    },
+    ToolSpec {
+        name: "development.propose",
+        description: "Propose a personality change for owner review.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ rationale: string, values?: string[], traits?: object }",
+    },
+    ToolSpec {
+        name: "development.list",
+        description: "List this Core's personality proposals.",
+        permission: "development.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "development.apply",
+        description: "Apply an owner-approved personality proposal.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::Sensitive,
+        approval_required: true,
+        input: "{ proposal_id: string }",
+    },
+    ToolSpec {
+        name: "development.reject",
+        description: "Reject a proposed personality change.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::Sensitive,
+        approval_required: true,
+        input: "{ proposal_id: string }",
+    },
+    ToolSpec {
+        name: "development.revert",
+        description: "Restore the previous personality revision.",
+        permission: "development.write",
+        sensitivity: ToolSensitivity::Sensitive,
+        approval_required: true,
+        input: "{}",
     },
 ];
 
@@ -870,7 +935,7 @@ impl ToolExecutor {
             )
             .map_err(|error| error.to_string())
         } else {
-            self.run(&resolved.name, &object)
+            self.run(&resolved.name, &object, owner_token)
                 .map_err(|error| error.to_string())
         };
 
@@ -918,6 +983,7 @@ impl ToolExecutor {
         &self,
         tool: &str,
         arguments: &serde_json::Map<String, Value>,
+        owner_token: Option<&str>,
     ) -> Result<Value, ToolError> {
         match tool {
             "memory.search" => self.memory_search(arguments),
@@ -979,6 +1045,14 @@ impl ToolExecutor {
             "autonomy.tick" => self.autonomy_tick(),
             "autonomy.settings" => self.autonomy_settings(),
             "autonomy.set_enabled" => self.autonomy_set_enabled(arguments),
+            "preference.record" => self.preference_record(arguments),
+            "preference.list" => self.preference_list(arguments),
+            "development.reflect" => self.development_reflect(),
+            "development.propose" => self.development_propose(arguments),
+            "development.list" => self.development_list(arguments),
+            "development.apply" => self.development_apply(arguments, owner_token),
+            "development.reject" => self.development_reject(arguments, owner_token),
+            "development.revert" => self.development_revert(owner_token),
             _ => Err(ToolError::InvalidInput("unknown tool")),
         }
     }
@@ -1614,6 +1688,98 @@ impl ToolExecutor {
         Ok(serde_json::to_value(updated)?)
     }
 
+    fn development(&self) -> Result<DevelopmentStore, ToolError> {
+        Ok(DevelopmentStore::open(
+            self.paths.root(),
+            &self.caller_core,
+        )?)
+    }
+
+    fn preference_record(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let key = optional_str(arguments, "key", 128)?.ok_or(ToolError::InvalidInput("key"))?;
+        let valence = required_f32(arguments, "valence", -1.0, 1.0)?;
+        let weight = required_f32(arguments, "weight", 0.0, 1.0)?;
+        let source = optional_str(arguments, "source", 128)?.unwrap_or_else(|| "tool".to_owned());
+        let preference = self
+            .development()?
+            .record_preference_evidence(&key, valence, weight, &source)?;
+        Ok(serde_json::to_value(preference)?)
+    }
+
+    fn preference_list(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let preferences = self.development()?.list_preferences(limit as usize)?;
+        Ok(serde_json::to_value(preferences)?)
+    }
+
+    fn development_reflect(&self) -> Result<Value, ToolError> {
+        let reflection = self.development()?.reflect()?;
+        Ok(serde_json::to_value(reflection)?)
+    }
+
+    fn development_propose(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let rationale = optional_text(arguments, "rationale", 2048)?
+            .ok_or(ToolError::InvalidInput("rationale"))?;
+        let values = optional_string_array(arguments, "values", 64, 256)?;
+        let traits = optional_float_map(arguments, "traits", 128, 64)?;
+        let proposal = self
+            .development()?
+            .propose_personality_change(&rationale, values, traits)?;
+        Ok(serde_json::to_value(proposal)?)
+    }
+
+    fn development_list(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let proposals = self.development()?.list_proposals(limit as usize)?;
+        Ok(serde_json::to_value(proposals)?)
+    }
+
+    fn development_apply(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        owner_token: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        let proposal_id = optional_str(arguments, "proposal_id", 128)?
+            .ok_or(ToolError::InvalidInput("proposal_id"))?;
+        let token = owner_token.ok_or(ToolError::InvalidInput("owner_token"))?;
+        let profile = self.development()?.apply_proposal(token, &proposal_id)?;
+        Ok(serde_json::to_value(profile)?)
+    }
+
+    fn development_reject(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        owner_token: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        let proposal_id = optional_str(arguments, "proposal_id", 128)?
+            .ok_or(ToolError::InvalidInput("proposal_id"))?;
+        let token = owner_token.ok_or(ToolError::InvalidInput("owner_token"))?;
+        let proposal = self.development()?.reject_proposal(token, &proposal_id)?;
+        Ok(serde_json::to_value(proposal)?)
+    }
+
+    fn development_revert(&self, owner_token: Option<&str>) -> Result<Value, ToolError> {
+        let token = owner_token.ok_or(ToolError::InvalidInput("owner_token"))?;
+        let profile = self.development()?.revert_personality(token)?;
+        Ok(serde_json::to_value(profile)?)
+    }
+
     fn result(
         &self,
         tool: &str,
@@ -1783,6 +1949,60 @@ fn optional_u8(
         Some(value) if value <= maximum => Ok(Some(value as u8)),
         Some(_) => Err(ToolError::InvalidInput(key)),
         None => Ok(None),
+    }
+}
+
+fn required_f32(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+    minimum: f32,
+    maximum: f32,
+) -> Result<f32, ToolError> {
+    let value = match arguments.get(key) {
+        Some(Value::Number(number)) => number.as_f64().ok_or(ToolError::InvalidInput(key))? as f32,
+        _ => return Err(ToolError::InvalidInput(key)),
+    };
+    if !value.is_finite() || !(minimum..=maximum).contains(&value) {
+        return Err(ToolError::InvalidInput(key));
+    }
+    Ok(value)
+}
+
+fn optional_float_map(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+    maximum_items: usize,
+    maximum_chars: usize,
+) -> Result<BTreeMap<String, f32>, ToolError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(values)) => {
+            if values.len() > maximum_items {
+                return Err(ToolError::InvalidInput(key));
+            }
+            let mut output = BTreeMap::new();
+            for (name, value) in values {
+                let trimmed = name.trim();
+                if trimmed.is_empty()
+                    || name.chars().count() > maximum_chars
+                    || name.chars().any(char::is_control)
+                {
+                    return Err(ToolError::InvalidInput(key));
+                }
+                let number = match value {
+                    Value::Number(number) => {
+                        number.as_f64().ok_or(ToolError::InvalidInput(key))? as f32
+                    }
+                    _ => return Err(ToolError::InvalidInput(key)),
+                };
+                if !number.is_finite() || !(-1.0..=1.0).contains(&number) {
+                    return Err(ToolError::InvalidInput(key));
+                }
+                output.insert(name.clone(), number);
+            }
+            Ok(output)
+        }
+        Some(_) => Err(ToolError::InvalidInput(key)),
     }
 }
 

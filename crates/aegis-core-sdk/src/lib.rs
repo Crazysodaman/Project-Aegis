@@ -12,13 +12,17 @@ pub mod autonomy;
 pub mod autonomy_engine;
 pub mod capability;
 pub mod consent;
+pub mod development;
 pub mod events;
 pub mod memory;
 pub mod personal;
 pub mod personality;
 pub mod possessions;
 
-pub use aegis_contracts::living::{AutonomySettings, Goal, Plan, PlanStatus, Task, TaskStatus};
+pub use aegis_contracts::living::{
+    AutonomySettings, Goal, PersonalityProposal, PersonalityProposalStatus, Plan, PlanStatus,
+    Preference, Reflection, Task, TaskStatus,
+};
 pub use autonomy::{
     AutonomyEvent, AutonomyStore, AUTONOMY_APPLICATION_ID, AUTONOMY_COMPONENT, AUTONOMY_DB_FILE,
     AUTONOMY_EVENTS_TABLE, AUTONOMY_EVENT_SCHEMA, AUTONOMY_GOALS_TABLE, AUTONOMY_OWNERSHIP_TABLE,
@@ -37,6 +41,13 @@ pub use consent::{
     CONSENT_EXPIRE_ACTION, CONSENT_GRANTS_TABLE, CONSENT_GRANT_ACTION, CONSENT_OWNERSHIP_TABLE,
     CONSENT_REVOKE_ACTION, CONSENT_SCHEMA, CONSENT_SCHEMA_REVISION, CONSENT_SCHEMA_TABLE,
     MAX_CONSENT_EVENT_DETAIL_BYTES, MAX_CONSENT_EVENT_LIST, MAX_CONSENT_LIST,
+};
+pub use development::{
+    DevelopmentEvent, DevelopmentStore, DEVELOPMENT_EVENTS_TABLE, DEVELOPMENT_EVENT_SCHEMA,
+    DEVELOPMENT_EVIDENCE_TABLE, DEVELOPMENT_PREFERENCES_TABLE, DEVELOPMENT_PROPOSALS_TABLE,
+    DEVELOPMENT_REFLECTIONS_TABLE, DEVELOPMENT_SCHEMA, MAX_DEVELOPMENT_EVENT_DETAIL_BYTES,
+    MAX_DEVELOPMENT_EVENT_LIST, MAX_DEVELOPMENT_LIST, MAX_DEVELOPMENT_SOURCE_CHARS,
+    MAX_REFLECTION_PREFERENCES, PREFERENCE_BASE_ALPHA, PREFERENCE_WEIGHT_ALPHA,
 };
 pub use events::{
     apply_interaction_event, apply_interaction_event_at, interaction_influence, EventApplication,
@@ -153,6 +164,10 @@ pub enum SdkError {
     ImportConflict(String),
     #[error("memory database is corrupt: {0}")]
     CorruptData(&'static str),
+    #[error("owner authorization failed")]
+    Unauthorized,
+    #[error("Safe operation failed: {0}")]
+    Safe(#[from] aegis_safe::SafeError),
 }
 
 pub(crate) fn canonical_core_id(value: &str) -> Result<String, SdkError> {
@@ -212,6 +227,7 @@ pub struct CoreSdkContext {
     pub possessions: PossessionsStore,
     pub consent: ConsentStore,
     pub autonomy: AutonomyStore,
+    pub development: DevelopmentStore,
     pub personality: Option<PersonalityProfile>,
 }
 
@@ -233,6 +249,7 @@ impl CoreSdkContext {
         let possessions = PossessionsStore::open(root, &core_uuid)?;
         let consent = ConsentStore::open(root, &core_uuid)?;
         let autonomy = AutonomyStore::open(root, &core_uuid)?;
+        let development = DevelopmentStore::open(root, &core_uuid)?;
         let capabilities = CapabilityManifest::full(&core_uuid)?;
         let personality = memory.load_personality()?;
         Ok(Self {
@@ -243,6 +260,7 @@ impl CoreSdkContext {
             possessions,
             consent,
             autonomy,
+            development,
             personality,
         })
     }
@@ -280,6 +298,12 @@ impl CoreSdkContext {
     /// Borrow the autonomy store bound to the same Core identity.
     pub fn autonomy(&self) -> &AutonomyStore {
         &self.autonomy
+    }
+
+    /// Borrow the personality development store bound to the same Core
+    /// identity.
+    pub fn development(&self) -> &DevelopmentStore {
+        &self.development
     }
 
     /// Borrow the most recently loaded personality profile, if any.
