@@ -10,6 +10,7 @@ use aegis_cognition::{
 };
 use aegis_contracts::initialization::{CoreInitializationRequest, CORE_INIT_REQUEST_SCHEMA};
 use aegis_contracts::ipc::IpcRequest;
+use aegis_contracts::living::TransferType;
 use aegis_conversation::{ConversationEngine, EmbeddingRetriever, TurnOptions};
 use aegis_core_install::{install_package, CoreInspection, CoreInstallation, CoreInstaller};
 use aegis_core_runtime::CoreRuntime;
@@ -32,7 +33,8 @@ use aegis_ipc::{
 };
 use aegis_modules::{ModuleManager, ModuleRuntime, ModuleRuntimeStatus};
 use aegis_platform::{
-    CatalogStore, OpenMeteoProvider, PlatformService, UnavailableWeatherProvider, WorldService,
+    CatalogStore, OpenMeteoProvider, PlatformService, TransferStore, UnavailableWeatherProvider,
+    WorldService,
 };
 use aegis_roster::{resolve_display_name, validate_roster, ApprovedCoreDesign};
 use aegis_service::ServiceManager;
@@ -1156,6 +1158,12 @@ fn command_living(args: &[String]) -> Result<(), String> {
             "results": results,
         }));
     }
+    if group == "consent" {
+        return command_consent(root, args);
+    }
+    if group == "transfer" {
+        return command_transfer(root, args);
+    }
 
     require_owner_proof(root)?;
     let core = require_arg(args, "--core")?;
@@ -1326,6 +1334,137 @@ fn living_positional_id(args: &[String]) -> Option<String> {
         return Some(token.to_owned());
     }
     None
+}
+
+fn command_consent(root: &str, args: &[String]) -> Result<(), String> {
+    require_owner_proof(root)?;
+    let core = require_arg(args, "--core")?;
+    let action = args.get(2).map(String::as_str).unwrap_or("list");
+    let executor =
+        ToolExecutor::new(PathBuf::from(root), core).map_err(|error| error.to_string())?;
+    let limit = parse_usize(args, "--limit", 50)?;
+    let participants = parse_tags(optional_arg(args, "--participants"));
+    let (tool, arguments, approval) = match action {
+        "grant" => (
+            "consent.grant",
+            json!({
+                "scope": require_arg(args, "--scope")?,
+                "capability": require_arg(args, "--capability")?,
+                "participants": participants,
+                "context": optional_arg(args, "--context").unwrap_or(""),
+                "expires_at": optional_arg(args, "--expires-at"),
+            }),
+            None,
+        ),
+        "grant-intimate" => (
+            "consent.grant_intimate",
+            json!({
+                "scope": require_arg(args, "--scope")?,
+                "capability": require_arg(args, "--capability")?,
+                "participants": participants,
+                "context": optional_arg(args, "--context").unwrap_or(""),
+                "expires_at": optional_arg(args, "--expires-at"),
+            }),
+            Some(owner_token(root)?),
+        ),
+        "revoke" => (
+            "consent.revoke",
+            json!({"grant_id": require_arg(args, "--grant-id")?}),
+            None,
+        ),
+        "list" => ("consent.list", json!({"limit": limit}), None),
+        "check" => (
+            "consent.check",
+            json!({
+                "scope": require_arg(args, "--scope")?,
+                "capability": require_arg(args, "--capability")?,
+                "participant": optional_arg(args, "--participant"),
+            }),
+            None,
+        ),
+        other => return Err(format!("unknown consent command: {other}")),
+    };
+    let result = executor
+        .execute(tool, &arguments, approval.as_deref())
+        .map_err(|error| error.to_string())?;
+    print_json(&json!({
+        "schema": "aegis.cli.consent.v1",
+        "tool": tool,
+        "status": result.status.as_str(),
+        "output": result.output,
+        "detail": result.detail,
+    }))
+}
+
+fn command_transfer(root: &str, args: &[String]) -> Result<(), String> {
+    require_owner_proof(root)?;
+    let paths = StoragePaths::new(PathBuf::from(root)).map_err(|error| error.to_string())?;
+    let store = TransferStore::new(paths);
+    store.initialize().map_err(|error| error.to_string())?;
+    let token = owner_token(root)?;
+    let action = args.get(2).map(String::as_str).unwrap_or("list");
+    let limit = parse_usize(args, "--limit", 50)?;
+    let transfer_id = optional_arg(args, "--transfer-id");
+    let value = match action {
+        "offer" => {
+            let transfer_type = TransferType::parse(optional_arg(args, "--type").unwrap_or("gift"))
+                .ok_or_else(|| "unknown transfer --type".to_owned())?;
+            serde_json::to_value(
+                store
+                    .offer(
+                        &token,
+                        require_arg(args, "--from")?,
+                        require_arg(args, "--to")?,
+                        require_arg(args, "--item")?,
+                        transfer_type,
+                        optional_arg(args, "--note").unwrap_or(""),
+                    )
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "list" => serde_json::to_value(store.list(limit).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?,
+        "get" => {
+            let id = transfer_id.ok_or_else(|| "missing --transfer-id".to_owned())?;
+            serde_json::to_value(store.get(id).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?
+        }
+        "accept" => {
+            let id = transfer_id.ok_or_else(|| "missing --transfer-id".to_owned())?;
+            serde_json::to_value(
+                store
+                    .accept(&token, id)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "reject" => {
+            let id = transfer_id.ok_or_else(|| "missing --transfer-id".to_owned())?;
+            serde_json::to_value(
+                store
+                    .reject(&token, id)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "cancel" => {
+            let id = transfer_id.ok_or_else(|| "missing --transfer-id".to_owned())?;
+            serde_json::to_value(
+                store
+                    .cancel(&token, id)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        "events" => {
+            let id = transfer_id.ok_or_else(|| "missing --transfer-id".to_owned())?;
+            serde_json::to_value(store.events(id, limit).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?
+        }
+        other => return Err(format!("unknown transfer command: {other}")),
+    };
+    print_json(&json!({"schema": "aegis.cli.transfer.v1", "result": value}))
 }
 
 fn command_personal(args: &[String]) -> Result<(), String> {
@@ -2420,6 +2559,8 @@ fn usage() {
          aegis personal show --root <path> --core <core-id>\n\
          aegis living item|outfit|document|object list|create|show|modify|archive|rename|read|write|update --root <path> --core <id> [options]\n\
          aegis living catalog search <text> --root <path>\n\
+         aegis living consent grant|grant-intimate|revoke|list|check --root <path> --core <id> [options]\n\
+         aegis living transfer offer|list|get|accept|reject|cancel|events --root <path> [options]\n\
          aegis voice synthesize --root <path> --core <core-id> --text <text> --out <wav> [--rate <percent>] [--volume <percent>]\n\
          aegis asset import <core-id> <kind> <file> --root <path> [--name <name>] [--media-type <type>] [--tags a,b]\n\
          aegis asset list <core-id> --root <path> [--kind <kind>] [--include-deleted]\n\

@@ -9,14 +9,19 @@
 //! never written to the audit record.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aegis_contracts::living::{DocumentFormat, ItemCategory, Visibility};
+use aegis_contracts::living::{
+    ConsentScope, DocumentFormat, ItemCategory, Visibility, LIVING_CONTRACT_VERSION,
+};
 use aegis_core_install::CoreInstaller;
 use aegis_core_sdk::possessions::{
     InstanceUpdate, NewInstance, NewObject, NewOutfit, ObjectUpdate, PossessionsStore,
 };
-use aegis_core_sdk::{CoreMemoryStore, MemoryKind, MemoryQuery, NewMemory};
+use aegis_core_sdk::{
+    ConsentGrant, ConsentStore, CoreMemoryStore, MemoryKind, MemoryQuery, NewMemory,
+};
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_modules::{
     run_module_tool, ModuleManager, ModuleRegistry, ModuleToolBinding, MAX_TOOL_INPUT_BYTES,
@@ -262,6 +267,46 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         sensitivity: ToolSensitivity::ReadOnly,
         approval_required: false,
         input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "consent.grant",
+        description: "Record scoped consent for conversation, objects, or shared projects.",
+        permission: "consent.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ scope: string, capability: string, participants?: string[], context?: string, expires_at?: string }",
+    },
+    ToolSpec {
+        name: "consent.grant_intimate",
+        description: "Record scoped intimate consent (affection, romantic, adult); requires owner approval.",
+        permission: "consent.write",
+        sensitivity: ToolSensitivity::Sensitive,
+        approval_required: true,
+        input: "{ scope: string, capability: string, participants?: string[], context?: string, expires_at?: string }",
+    },
+    ToolSpec {
+        name: "consent.revoke",
+        description: "Revoke one of this Core's consent grants immediately.",
+        permission: "consent.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ grant_id: string }",
+    },
+    ToolSpec {
+        name: "consent.list",
+        description: "List this Core's consent grants.",
+        permission: "consent.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "consent.check",
+        description: "Check whether active consent matches scope, capability, and participant.",
+        permission: "consent.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ scope: string, capability: string, participant?: string }",
     },
 ];
 
@@ -811,6 +856,11 @@ impl ToolExecutor {
             "object.get" => self.object_get(arguments),
             "object.update" => self.object_update(arguments),
             "object.list" => self.object_list(arguments),
+            "consent.grant" => self.consent_grant(arguments, false),
+            "consent.grant_intimate" => self.consent_grant(arguments, true),
+            "consent.revoke" => self.consent_revoke(arguments),
+            "consent.list" => self.consent_list(arguments),
+            "consent.check" => self.consent_check(arguments),
             _ => Err(ToolError::InvalidInput("unknown tool")),
         }
     }
@@ -1203,6 +1253,92 @@ impl ToolExecutor {
         Ok(serde_json::to_value(objects)?)
     }
 
+    fn consent(&self) -> Result<ConsentStore, ToolError> {
+        Ok(ConsentStore::open(self.paths.root(), &self.caller_core)?)
+    }
+
+    fn consent_grant(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        intimate: bool,
+    ) -> Result<Value, ToolError> {
+        let scope_value =
+            optional_str(arguments, "scope", 64)?.ok_or(ToolError::InvalidInput("scope"))?;
+        let scope = parse_consent_scope(&scope_value).ok_or(ToolError::InvalidInput("scope"))?;
+        let allowed = if intimate {
+            matches!(
+                scope,
+                ConsentScope::Affection | ConsentScope::Romantic | ConsentScope::Adult
+            )
+        } else {
+            matches!(
+                scope,
+                ConsentScope::Conversation | ConsentScope::Object | ConsentScope::SharedProject
+            )
+        };
+        if !allowed {
+            return Err(ToolError::InvalidInput("scope"));
+        }
+        let capability = optional_str(arguments, "capability", 64)?
+            .ok_or(ToolError::InvalidInput("capability"))?;
+        let participants = optional_string_array(arguments, "participants", 256, 128)?;
+        let context = optional_text(arguments, "context", 4096)?.unwrap_or_default();
+        let expires_at = optional_str(arguments, "expires_at", 64)?;
+        let grant = ConsentGrant {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            grant_id: new_consent_grant_id(),
+            core_uuid: self.caller_core.clone(),
+            scope,
+            capability,
+            participants,
+            granted_at: now_rfc3339()?,
+            expires_at,
+            revoked_at: None,
+            context,
+        };
+        let stored = self.consent()?.grant(&grant)?;
+        Ok(serde_json::to_value(stored)?)
+    }
+
+    fn consent_revoke(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let grant_id =
+            optional_str(arguments, "grant_id", 128)?.ok_or(ToolError::InvalidInput("grant_id"))?;
+        let revoked = self.consent()?.revoke(&grant_id)?;
+        Ok(serde_json::to_value(revoked)?)
+    }
+
+    fn consent_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let grants = self.consent()?.list(limit as usize)?;
+        Ok(serde_json::to_value(grants)?)
+    }
+
+    fn consent_check(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let scope_value =
+            optional_str(arguments, "scope", 64)?.ok_or(ToolError::InvalidInput("scope"))?;
+        let scope = parse_consent_scope(&scope_value).ok_or(ToolError::InvalidInput("scope"))?;
+        let capability = optional_str(arguments, "capability", 64)?
+            .ok_or(ToolError::InvalidInput("capability"))?;
+        let participant = optional_str(arguments, "participant", 128)?;
+        let now = now_rfc3339()?;
+        let store = self.consent()?;
+        let active = match participant.as_deref() {
+            Some(participant) => store.check(scope, &capability, participant, &now),
+            None => !store
+                .active(Some(scope), Some(&capability), None, &now)?
+                .is_empty(),
+        };
+        Ok(json!({ "active": active }))
+    }
+
     fn result(
         &self,
         tool: &str,
@@ -1400,6 +1536,32 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
         return value.to_owned();
     }
     value.chars().take(maximum).collect()
+}
+
+fn parse_consent_scope(value: &str) -> Option<ConsentScope> {
+    Some(match value {
+        "conversation" => ConsentScope::Conversation,
+        "affection" => ConsentScope::Affection,
+        "romantic" => ConsentScope::Romantic,
+        "adult" => ConsentScope::Adult,
+        "object" => ConsentScope::Object,
+        "shared_project" => ConsentScope::SharedProject,
+        _ => return None,
+    })
+}
+
+static CONSENT_GRANT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn new_consent_grant_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = CONSENT_GRANT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "grant-{nanos:032x}-{sequence:016x}-{:x}",
+        std::process::id()
+    )
 }
 
 /// Resolve a tool spec for callers that only need metadata.

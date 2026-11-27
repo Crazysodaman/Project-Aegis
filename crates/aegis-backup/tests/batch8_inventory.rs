@@ -8,6 +8,7 @@ use aegis_backup::{
 };
 use aegis_contracts::initialization::{CoreInitializationRequest, CORE_INIT_REQUEST_SCHEMA};
 use aegis_core_install::CoreInstaller;
+use aegis_core_integrity::compute_file_sha256;
 use aegis_platform::PlatformService;
 use aegis_storage::now_rfc3339;
 use serde_json::Value;
@@ -22,6 +23,7 @@ const STANDARD_SIDECARS: &[(&str, &str)] = &[
     ("social.db", "relationship_ownership"),
     ("embeddings.db", "embedding_ownership"),
     ("possessions.db", "possessions_ownership"),
+    ("consent.db", "consent_ownership"),
 ];
 
 fn init_platform() -> (tempfile::TempDir, String) {
@@ -256,9 +258,9 @@ fn full_inventory_backup_and_restore_is_isolated() {
         .find(|core| core.core_uuid == CORE_B)
         .expect("Core B metadata");
 
-    // Core A has core.db plus seven sidecars; Core B lacks personal.db.
-    assert_eq!(core_a.databases.len(), 8);
-    assert_eq!(core_b.databases.len(), 7);
+    // Core A has core.db plus eight sidecars; Core B lacks personal.db.
+    assert_eq!(core_a.databases.len(), 9);
+    assert_eq!(core_b.databases.len(), 8);
     assert!(core_a
         .databases
         .iter()
@@ -396,12 +398,89 @@ fn missing_optional_databases_are_reported_not_fatal() {
             .iter()
             .any(|db| db.file_name == CORE_DATABASE_FILE));
         assert_eq!(core.databases.len(), 1);
-        assert_eq!(core.missing_optional_databases.len(), 7);
+        assert_eq!(core.missing_optional_databases.len(), 8);
     }
 
     let (_target_parent, target) = target_path();
     restore(&destination, &target, RestoreOptions::default()).expect("restore without sidecars");
     assert!(target.join("cores").join(CORE_A).join("core.db").is_file());
+}
+
+#[test]
+fn consent_database_is_backed_up_and_restored_with_ownership_and_digest() {
+    let (source, token) = init_platform();
+    install(source.path(), &token, CORE_A, 1, "Core A");
+    install(source.path(), &token, CORE_B, 2, "Core B");
+
+    // Core A has a consent database; Core B does not.
+    write_sidecar(
+        source.path(),
+        CORE_A,
+        "consent.db",
+        "consent_ownership",
+        "A-consent.db",
+    );
+
+    let (_backup_parent, destination) = backup_path();
+    let report = backup(source.path(), &destination).expect("backup consent");
+
+    let core_a = report
+        .manifest
+        .cores
+        .iter()
+        .find(|core| core.core_uuid == CORE_A)
+        .expect("Core A metadata");
+    let core_b = report
+        .manifest
+        .cores
+        .iter()
+        .find(|core| core.core_uuid == CORE_B)
+        .expect("Core B metadata");
+
+    let consent = core_a
+        .databases
+        .iter()
+        .find(|db| db.file_name == "consent.db")
+        .expect("consent database entry");
+    assert_eq!(consent.kind, BackupFileKind::CoreConsentDatabase);
+    assert_eq!(consent.ownership_table, "consent_ownership");
+    assert_eq!(consent.relative_path, format!("cores/{CORE_A}/consent.db"));
+    assert_eq!(consent.sha256.len(), 64);
+    assert!(consent.bytes > 0);
+    let consent_file = report
+        .manifest
+        .file(&consent.relative_path)
+        .expect("consent file entry");
+    assert_eq!(consent_file.kind, BackupFileKind::CoreConsentDatabase);
+    assert_eq!(consent_file.sha256, consent.sha256);
+    assert_eq!(consent_file.bytes, consent.bytes);
+
+    assert!(!core_b
+        .databases
+        .iter()
+        .any(|db| db.file_name == "consent.db"));
+    assert!(core_b
+        .missing_optional_databases
+        .contains(&"consent.db".to_owned()));
+    assert!(report
+        .missing_databases
+        .contains(&format!("cores/{CORE_B}/consent.db")));
+
+    let verification = verify_backup(&destination).expect("verify consent");
+    assert_eq!(verification.status, BackupVerificationStatus::Verified);
+    assert!(verification.issues.is_empty());
+
+    let (_target_parent, target) = target_path();
+    restore(&destination, &target, RestoreOptions::default()).expect("restore consent");
+
+    let restored = core_dir(&target, CORE_A).join("consent.db");
+    assert_eq!(ownership_core_uuid(&restored, "consent_ownership"), CORE_A);
+    assert_eq!(marker_value(&restored), "A-consent.db");
+    assert_eq!(
+        compute_file_sha256(&restored).expect("restored consent digest"),
+        consent.sha256
+    );
+    assert!(!core_dir(&target, CORE_B).join("consent.db").exists());
 }
 
 #[test]

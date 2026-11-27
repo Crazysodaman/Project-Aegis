@@ -527,6 +527,72 @@ impl DocumentFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferType {
+    Gift,
+    Loan,
+    Trade,
+    Swap,
+    Return,
+}
+
+impl TransferType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gift => "gift",
+            Self::Loan => "loan",
+            Self::Trade => "trade",
+            Self::Swap => "swap",
+            Self::Return => "return",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "gift" => Self::Gift,
+            "loan" => Self::Loan,
+            "trade" => Self::Trade,
+            "swap" => Self::Swap,
+            "return" => Self::Return,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Cancelled,
+    Failed,
+}
+
+impl TransferStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pending" => Self::Pending,
+            "accepted" => Self::Accepted,
+            "rejected" => Self::Rejected,
+            "cancelled" => Self::Cancelled,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

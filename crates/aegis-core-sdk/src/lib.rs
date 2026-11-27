@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod consent;
 pub mod events;
 pub mod memory;
 pub mod personal;
@@ -18,6 +19,13 @@ pub mod possessions;
 pub use capability::{
     CapabilityManifest, CoreCapability, ALL_CAPABILITIES, CAPABILITY_MANIFEST_SCHEMA,
     REQUIRED_CAPABILITIES,
+};
+pub use consent::{
+    ConsentEvent, ConsentGrant, ConsentScope, ConsentStore, CONSENT_APPLICATION_ID,
+    CONSENT_COMPONENT, CONSENT_DB_FILE, CONSENT_EVENTS_TABLE, CONSENT_EVENT_SCHEMA,
+    CONSENT_EXPIRE_ACTION, CONSENT_GRANTS_TABLE, CONSENT_GRANT_ACTION, CONSENT_OWNERSHIP_TABLE,
+    CONSENT_REVOKE_ACTION, CONSENT_SCHEMA, CONSENT_SCHEMA_REVISION, CONSENT_SCHEMA_TABLE,
+    MAX_CONSENT_EVENT_DETAIL_BYTES, MAX_CONSENT_EVENT_LIST, MAX_CONSENT_LIST,
 };
 pub use events::{
     apply_interaction_event, apply_interaction_event_at, interaction_influence, EventApplication,
@@ -56,8 +64,8 @@ pub use possessions::{
     MAX_PROPERTIES_BYTES, OUTFITS_TABLE, POSSESSIONS_APPLICATION_ID, POSSESSIONS_COMPONENT,
     POSSESSIONS_DB_FILE, POSSESSIONS_OWNERSHIP_TABLE, POSSESSIONS_SCHEMA,
     POSSESSIONS_SCHEMA_REVISION, POSSESSIONS_SCHEMA_TABLE, POSSESSION_EVENTS_TABLE,
-    POSSESSION_EVENT_SCHEMA, TRANSFER_DELIVERY_PENDING, TRANSFER_OFFER_ACTION,
-    TRANSFER_OFFER_STATUS, WORLD_OBJECTS_TABLE,
+    POSSESSION_EVENT_SCHEMA, TRANSFER_DELIVERY_PENDING, TRANSFER_IN_ACTION, TRANSFER_OFFER_ACTION,
+    TRANSFER_OFFER_STATUS, TRANSFER_OUT_ACTION, TRANSFER_ROLLBACK_ACTION, WORLD_OBJECTS_TABLE,
 };
 
 use std::path::Path;
@@ -191,6 +199,7 @@ pub struct CoreSdkContext {
     pub memory: CoreMemoryStore,
     pub personal: PersonalStore,
     pub possessions: PossessionsStore,
+    pub consent: ConsentStore,
     pub personality: Option<PersonalityProfile>,
 }
 
@@ -210,6 +219,7 @@ impl CoreSdkContext {
         let memory = CoreMemoryStore::open(root, &core_uuid)?;
         let personal = PersonalStore::open(root, &core_uuid)?;
         let possessions = PossessionsStore::open(root, &core_uuid)?;
+        let consent = ConsentStore::open(root, &core_uuid)?;
         let capabilities = CapabilityManifest::full(&core_uuid)?;
         let personality = memory.load_personality()?;
         Ok(Self {
@@ -218,6 +228,7 @@ impl CoreSdkContext {
             memory,
             personal,
             possessions,
+            consent,
             personality,
         })
     }
@@ -245,6 +256,11 @@ impl CoreSdkContext {
     /// Borrow the possessions store bound to the same Core identity.
     pub fn possessions(&self) -> Result<&PossessionsStore, SdkError> {
         Ok(&self.possessions)
+    }
+
+    /// Borrow the consent store bound to the same Core identity.
+    pub fn consent(&self) -> Result<&ConsentStore, SdkError> {
+        Ok(&self.consent)
     }
 
     /// Borrow the most recently loaded personality profile, if any.

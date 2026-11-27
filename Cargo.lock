@@ -358,12 +358,14 @@ name = "aegis-platform"
 version = "0.1.0"
 dependencies = [
  "aegis-contracts",
+ "aegis-core-sdk",
  "aegis-modules",
  "aegis-safe",
  "aegis-storage",
  "chrono",
  "chrono-tz",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

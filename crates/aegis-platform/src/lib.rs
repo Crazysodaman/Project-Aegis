@@ -3,6 +3,7 @@
 mod catalog;
 mod service;
 mod store;
+mod transfer;
 mod weather;
 mod world;
 
@@ -12,6 +13,10 @@ pub use catalog::{
 };
 pub use service::{InitializationResult, PlatformService, ServiceError};
 pub use store::{PlatformIdentity, PlatformStore};
+pub use transfer::{
+    TransferError, TransferEvent, TransferRecord, TransferStore, TRANSFER_DEFAULT_LIMIT,
+    TRANSFER_MAX_EVENTS, TRANSFER_MAX_LIMIT, TRANSFER_MAX_NOTE_CHARS,
+};
 pub use weather::{
     parse_open_meteo, wmo_condition, OpenMeteoProvider, OPEN_METEO_CACHE_TTL_SECONDS,
     OPEN_METEO_ENDPOINT, OPEN_METEO_PROVIDER_NAME,

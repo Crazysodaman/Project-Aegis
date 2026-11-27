@@ -85,6 +85,12 @@ pub const TRANSFER_OFFER_ACTION: &str = "transfer_offered";
 pub const TRANSFER_OFFER_STATUS: &str = "offered";
 /// Reason recorded on a transfer offer event.
 pub const TRANSFER_DELIVERY_PENDING: &str = "pending_phase5_transfer_subsystem";
+/// Event action recorded when a transferred item is imported into this Core.
+pub const TRANSFER_IN_ACTION: &str = "transferred_in";
+/// Event action recorded when a transferred item leaves this Core.
+pub const TRANSFER_OUT_ACTION: &str = "transferred_out";
+/// Event action recorded when an imported item is rolled back.
+pub const TRANSFER_ROLLBACK_ACTION: &str = "transfer_rolled_back";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS possessions_ownership (
@@ -1364,6 +1370,223 @@ impl PossessionsStore {
         })
     }
 
+    /// Export an item owned by this Core for transfer to another Core.
+    ///
+    /// The returned snapshot carries the full item metadata and provenance. The
+    /// source row is not modified: ownership only changes when the sender later
+    /// calls [`Self::remove_transferred_item`] after the receiver imports it.
+    pub fn export_for_transfer(&self, instance_id: &str) -> Result<PossessionItem, SdkError> {
+        if !valid_id(instance_id) {
+            return Err(SdkError::NotFound);
+        }
+        match read_instance_owner(&self.connection, instance_id)? {
+            None => Err(SdkError::NotFound),
+            Some(owner) if owner != self.core_uuid => Err(SdkError::OwnershipMismatch),
+            Some(_) => read_item(&self.connection, &self.core_uuid, instance_id)?
+                .ok_or(SdkError::CorruptData("item instance row is missing")),
+        }
+    }
+
+    /// Import a transferred item as a brand-new instance owned by this Core.
+    ///
+    /// The new instance gets a fresh UUID, `holder_core_uuid = None`,
+    /// `state = "stored"`, and the source provenance plus a `transferred_in`
+    /// entry carrying `transfer_id`. The source Core is never mutated.
+    pub fn import_transferred_item(
+        &self,
+        source: &PossessionItem,
+        from_core_uuid: &str,
+        transfer_id: &str,
+    ) -> Result<PossessionItem, SdkError> {
+        let from_core_uuid = canonical_core_id(from_core_uuid)?;
+        if !valid_id(transfer_id) {
+            return Err(SdkError::InvalidMemory("transfer identifier is invalid"));
+        }
+        let source_owner = canonical_core_id(source.owner_core_uuid())?;
+        if source_owner != from_core_uuid {
+            return Err(SdkError::OwnershipMismatch);
+        }
+        if from_core_uuid == self.core_uuid {
+            return Err(SdkError::InvalidMemory(
+                "transfer source must be a different Core",
+            ));
+        }
+        validate_stored_item(source, &from_core_uuid)?;
+
+        let now = now_rfc3339()?;
+        let mut instance = ItemInstance::new(&self.core_uuid, &now);
+        instance.instance_id = Uuid::new_v4().to_string();
+        instance.definition_id = source.instance.definition_id.clone();
+        instance.state = DEFAULT_ITEM_STATE.to_owned();
+        instance.visibility = source.instance.visibility;
+        instance.condition_percent = source.instance.condition_percent;
+        instance.location = None;
+        instance.provenance = source.instance.provenance.clone();
+        if instance.provenance.len() >= MAX_LIST_ITEMS {
+            let overflow = instance.provenance.len() + 1 - MAX_LIST_ITEMS;
+            instance.provenance.drain(0..overflow);
+        }
+        instance.provenance.push(ProvenanceEntry {
+            at: now.clone(),
+            actor: from_core_uuid.clone(),
+            action: TRANSFER_IN_ACTION.to_owned(),
+            note: transfer_id.to_owned(),
+        });
+        instance
+            .validate()
+            .map_err(|_| SdkError::InvalidMemory("item instance failed validation"))?;
+
+        let item = PossessionItem {
+            instance,
+            name: source.name.clone(),
+            description: source.description.clone(),
+            category: source.category,
+            properties: source.properties.clone(),
+            updated_at: now.clone(),
+        };
+        validate_stored_item(&item, &self.core_uuid)?;
+        let payload_json = serde_json::to_string(&item)?;
+        let revision = revision_value(item.instance.revision)?;
+
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO item_instances(
+                instance_id, core_uuid, holder_core_uuid, definition_id, name, category,
+                state, visibility, condition_percent, location, payload_json,
+                created_at, updated_at, revision
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                item.instance.instance_id,
+                self.core_uuid,
+                item.instance.holder_core_uuid,
+                item.instance.definition_id,
+                item.name,
+                item.category.as_str(),
+                item.instance.state,
+                item.instance.visibility.as_str(),
+                i64::from(item.instance.condition_percent),
+                item.instance.location,
+                payload_json,
+                item.instance.created_at,
+                item.updated_at,
+                revision
+            ],
+        )?;
+        insert_event(
+            &transaction,
+            &self.core_uuid,
+            "item_instance",
+            &item.instance.instance_id,
+            TRANSFER_IN_ACTION,
+            &json!({
+                "transfer_id": transfer_id,
+                "from_core_uuid": from_core_uuid,
+                "source_instance_id": source.instance.instance_id,
+                "name": item.name,
+                "category": item.category.as_str(),
+            }),
+            Visibility::Private,
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(item)
+    }
+
+    /// Remove an item this Core transferred out and append a `transferred_out`
+    /// event. The append-only ledger preserves the history of the row.
+    pub fn remove_transferred_item(
+        &self,
+        instance_id: &str,
+        transfer_id: &str,
+    ) -> Result<(), SdkError> {
+        if !valid_id(transfer_id) {
+            return Err(SdkError::InvalidMemory("transfer identifier is invalid"));
+        }
+        self.delete_owned_item(
+            instance_id,
+            transfer_id,
+            TRANSFER_OUT_ACTION,
+            "item instance row is missing",
+        )
+    }
+
+    /// Roll back an imported item and append a `transfer_rolled_back` event.
+    ///
+    /// Used when the sender cannot remove its own copy. The instance must be
+    /// owned by this Core and must carry the matching `transferred_in`
+    /// provenance entry.
+    pub fn rollback_imported_item(
+        &self,
+        instance_id: &str,
+        transfer_id: &str,
+    ) -> Result<(), SdkError> {
+        if !valid_id(transfer_id) {
+            return Err(SdkError::InvalidMemory("transfer identifier is invalid"));
+        }
+        if !valid_id(instance_id) {
+            return Err(SdkError::NotFound);
+        }
+        let item = match read_instance_owner(&self.connection, instance_id)? {
+            None => return Err(SdkError::NotFound),
+            Some(owner) if owner != self.core_uuid => return Err(SdkError::OwnershipMismatch),
+            Some(_) => read_item(&self.connection, &self.core_uuid, instance_id)?
+                .ok_or(SdkError::CorruptData("item instance row is missing"))?,
+        };
+        let imported =
+            item.instance.provenance.iter().any(|entry| {
+                entry.action == TRANSFER_IN_ACTION && entry.note.as_str() == transfer_id
+            });
+        if !imported {
+            return Err(SdkError::InvalidMemory(
+                "item was not imported by this transfer",
+            ));
+        }
+        self.delete_owned_item(
+            instance_id,
+            transfer_id,
+            TRANSFER_ROLLBACK_ACTION,
+            "imported item instance row is missing",
+        )
+    }
+
+    fn delete_owned_item(
+        &self,
+        instance_id: &str,
+        transfer_id: &str,
+        action: &str,
+        missing_message: &'static str,
+    ) -> Result<(), SdkError> {
+        if !valid_id(instance_id) {
+            return Err(SdkError::NotFound);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        match read_instance_owner(&transaction, instance_id)? {
+            None => return Err(SdkError::NotFound),
+            Some(owner) if owner != self.core_uuid => return Err(SdkError::OwnershipMismatch),
+            Some(_) => {}
+        }
+        let now = now_rfc3339()?;
+        let changed = transaction.execute(
+            "DELETE FROM item_instances WHERE core_uuid = ?1 AND instance_id = ?2",
+            params![self.core_uuid, instance_id],
+        )?;
+        if changed != 1 {
+            return Err(SdkError::CorruptData(missing_message));
+        }
+        insert_event(
+            &transaction,
+            &self.core_uuid,
+            "item_instance",
+            instance_id,
+            action,
+            &json!({ "transfer_id": transfer_id }),
+            Visibility::Private,
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn validate_outfit_items(&self, item_instance_ids: &[String]) -> Result<(), SdkError> {
         for instance_id in item_instance_ids {
             let row: Option<(String, Option<String>)> = self
@@ -1472,6 +1695,20 @@ fn verify_ownership(
         return Err(SdkError::OwnershipMismatch);
     }
     Ok(())
+}
+
+fn read_instance_owner(
+    connection: &Connection,
+    instance_id: &str,
+) -> Result<Option<String>, SdkError> {
+    connection
+        .query_row(
+            "SELECT core_uuid FROM item_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(SdkError::from)
 }
 
 fn read_item(
