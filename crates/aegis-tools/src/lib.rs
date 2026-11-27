@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aegis_contracts::living::{
-    ConsentScope, DocumentFormat, ItemCategory, Visibility, LIVING_CONTRACT_VERSION,
+    ConsentScope, DocumentFormat, GoalStatus, ItemCategory, Visibility, LIVING_CONTRACT_VERSION,
 };
 use aegis_core_install::CoreInstaller;
 use aegis_core_sdk::possessions::{
     InstanceUpdate, NewInstance, NewObject, NewOutfit, ObjectUpdate, PossessionsStore,
 };
 use aegis_core_sdk::{
-    ConsentGrant, ConsentStore, CoreMemoryStore, MemoryKind, MemoryQuery, NewMemory,
+    AutonomyEngine, AutonomyStore, ConsentGrant, ConsentStore, CoreMemoryStore, CoreSdkContext,
+    Goal, MemoryKind, MemoryQuery, NewMemory, Task, TaskStatus,
 };
 use aegis_core_storage::{CoreDatabase, CoreStorageLayout};
 use aegis_modules::{
@@ -307,6 +308,110 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         sensitivity: ToolSensitivity::ReadOnly,
         approval_required: false,
         input: "{ scope: string, capability: string, participant?: string }",
+    },
+    ToolSpec {
+        name: "goal.create",
+        description: "Create a durable autonomy goal owned by this Core.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ title: string, description?: string, priority?: number, due_at?: string }",
+    },
+    ToolSpec {
+        name: "goal.list",
+        description: "List this Core's autonomy goals.",
+        permission: "autonomy.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "goal.update",
+        description: "Update supplied fields on one of this Core's goals.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ goal_id: string, status?: string, progress_percent?: number, priority?: number }",
+    },
+    ToolSpec {
+        name: "task.create",
+        description: "Schedule a durable autonomy task owned by this Core.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ title: string, activity_kind: string, payload?: object, due_at?: string, priority?: number, plan_id?: string, goal_id?: string }",
+    },
+    ToolSpec {
+        name: "task.list",
+        description: "List this Core's autonomy tasks.",
+        permission: "autonomy.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{ limit?: number }",
+    },
+    ToolSpec {
+        name: "task.start",
+        description: "Move one of this Core's pending or paused tasks to active.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ task_id: string }",
+    },
+    ToolSpec {
+        name: "task.pause",
+        description: "Pause one of this Core's active or pending tasks.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ task_id: string }",
+    },
+    ToolSpec {
+        name: "task.resume",
+        description: "Resume one of this Core's paused tasks.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ task_id: string }",
+    },
+    ToolSpec {
+        name: "task.complete",
+        description: "Complete one of this Core's tasks, optionally with progress.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ task_id: string, progress?: number }",
+    },
+    ToolSpec {
+        name: "task.cancel",
+        description: "Cancel one of this Core's non-terminal tasks.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ task_id: string }",
+    },
+    ToolSpec {
+        name: "autonomy.tick",
+        description: "Execute this Core's due autonomy tasks now through the real stores.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{}",
+    },
+    ToolSpec {
+        name: "autonomy.settings",
+        description: "Return this Core's autonomy settings.",
+        permission: "autonomy.read",
+        sensitivity: ToolSensitivity::ReadOnly,
+        approval_required: false,
+        input: "{}",
+    },
+    ToolSpec {
+        name: "autonomy.set_enabled",
+        description: "Enable or disable autonomy for this Core.",
+        permission: "autonomy.write",
+        sensitivity: ToolSensitivity::PersonalWrite,
+        approval_required: false,
+        input: "{ enabled: boolean, max_active_tasks?: number }",
     },
 ];
 
@@ -861,6 +966,19 @@ impl ToolExecutor {
             "consent.revoke" => self.consent_revoke(arguments),
             "consent.list" => self.consent_list(arguments),
             "consent.check" => self.consent_check(arguments),
+            "goal.create" => self.goal_create(arguments),
+            "goal.list" => self.goal_list(arguments),
+            "goal.update" => self.goal_update(arguments),
+            "task.create" => self.task_create(arguments),
+            "task.list" => self.task_list(arguments),
+            "task.start" => self.task_transition(arguments, TaskTransition::Start),
+            "task.pause" => self.task_transition(arguments, TaskTransition::Pause),
+            "task.resume" => self.task_transition(arguments, TaskTransition::Resume),
+            "task.complete" => self.task_complete(arguments),
+            "task.cancel" => self.task_transition(arguments, TaskTransition::Cancel),
+            "autonomy.tick" => self.autonomy_tick(),
+            "autonomy.settings" => self.autonomy_settings(),
+            "autonomy.set_enabled" => self.autonomy_set_enabled(arguments),
             _ => Err(ToolError::InvalidInput("unknown tool")),
         }
     }
@@ -1339,6 +1457,163 @@ impl ToolExecutor {
         Ok(json!({ "active": active }))
     }
 
+    fn autonomy(&self) -> Result<AutonomyStore, ToolError> {
+        Ok(AutonomyStore::open(self.paths.root(), &self.caller_core)?)
+    }
+
+    fn goal_create(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let title =
+            optional_str(arguments, "title", 160)?.ok_or(ToolError::InvalidInput("title"))?;
+        let description = optional_text(arguments, "description", 4096)?.unwrap_or_default();
+        let priority = optional_u8(arguments, "priority", 255)?.unwrap_or(0);
+        let due_at = optional_str(arguments, "due_at", 64)?;
+        let now = now_rfc3339()?;
+        let goal = Goal {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            goal_id: new_autonomy_id("goal"),
+            core_uuid: self.caller_core.clone(),
+            title,
+            description,
+            status: GoalStatus::Active,
+            priority,
+            due_at,
+            trigger: None,
+            progress_percent: 0,
+            provenance: "tool".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+            revision: 1,
+        };
+        let stored = self.autonomy()?.create_goal(&goal)?;
+        Ok(serde_json::to_value(stored)?)
+    }
+
+    fn goal_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let goals = self.autonomy()?.list_goals(limit as usize)?;
+        Ok(serde_json::to_value(goals)?)
+    }
+
+    fn goal_update(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let goal_id =
+            optional_str(arguments, "goal_id", 128)?.ok_or(ToolError::InvalidInput("goal_id"))?;
+        let store = self.autonomy()?;
+        let mut goal = store.get_goal(&goal_id)?.ok_or(ToolError::NotFound)?;
+        if let Some(status) = optional_str(arguments, "status", 32)? {
+            goal.status = parse_goal_status(&status).ok_or(ToolError::InvalidInput("status"))?;
+        }
+        if let Some(progress) = optional_u8(arguments, "progress_percent", 100)? {
+            goal.progress_percent = progress;
+        }
+        if let Some(priority) = optional_u8(arguments, "priority", 255)? {
+            goal.priority = priority;
+        }
+        let updated = store.update_goal(&goal)?;
+        Ok(serde_json::to_value(updated)?)
+    }
+
+    fn task_create(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let title =
+            optional_str(arguments, "title", 160)?.ok_or(ToolError::InvalidInput("title"))?;
+        let activity_kind = optional_str(arguments, "activity_kind", 64)?
+            .ok_or(ToolError::InvalidInput("activity_kind"))?;
+        let payload = optional_object(arguments, "payload")?;
+        let due_at = optional_str(arguments, "due_at", 64)?;
+        let priority = optional_u8(arguments, "priority", 255)?.unwrap_or(0);
+        let plan_id = optional_str(arguments, "plan_id", 128)?;
+        let goal_id = optional_str(arguments, "goal_id", 128)?;
+        let now = now_rfc3339()?;
+        let task = Task {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            task_id: new_autonomy_id("task"),
+            core_uuid: self.caller_core.clone(),
+            plan_id,
+            goal_id,
+            title,
+            activity_kind,
+            status: TaskStatus::Pending,
+            priority,
+            due_at,
+            progress_percent: 0,
+            payload,
+            created_at: now.clone(),
+            updated_at: now,
+            revision: 1,
+        };
+        let stored = self.autonomy()?.create_task(&task)?;
+        Ok(serde_json::to_value(stored)?)
+    }
+
+    fn task_list(&self, arguments: &serde_json::Map<String, Value>) -> Result<Value, ToolError> {
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(50)
+            .clamp(1, 256);
+        let tasks = self.autonomy()?.list_tasks(limit as usize)?;
+        Ok(serde_json::to_value(tasks)?)
+    }
+
+    fn task_transition(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+        transition: TaskTransition,
+    ) -> Result<Value, ToolError> {
+        let task_id =
+            optional_str(arguments, "task_id", 128)?.ok_or(ToolError::InvalidInput("task_id"))?;
+        let store = self.autonomy()?;
+        let task = match transition {
+            TaskTransition::Start => store.start_task(&task_id)?,
+            TaskTransition::Pause => store.pause_task(&task_id)?,
+            TaskTransition::Resume => store.resume_task(&task_id)?,
+            TaskTransition::Cancel => store.cancel_task(&task_id)?,
+        };
+        Ok(serde_json::to_value(task)?)
+    }
+
+    fn task_complete(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let task_id =
+            optional_str(arguments, "task_id", 128)?.ok_or(ToolError::InvalidInput("task_id"))?;
+        let progress = optional_u8(arguments, "progress", 100)?.unwrap_or(100);
+        let task = self.autonomy()?.complete_task(&task_id, progress)?;
+        Ok(serde_json::to_value(task)?)
+    }
+
+    fn autonomy_tick(&self) -> Result<Value, ToolError> {
+        let now = now_rfc3339()?;
+        let context = CoreSdkContext::open(self.paths.root(), &self.caller_core)?;
+        let engine = AutonomyEngine::new(&context);
+        let runs = engine.run_due(&now)?;
+        Ok(serde_json::to_value(runs)?)
+    }
+
+    fn autonomy_settings(&self) -> Result<Value, ToolError> {
+        let settings = self.autonomy()?.settings()?;
+        Ok(serde_json::to_value(settings)?)
+    }
+
+    fn autonomy_set_enabled(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, ToolError> {
+        let enabled =
+            optional_bool(arguments, "enabled")?.ok_or(ToolError::InvalidInput("enabled"))?;
+        let store = self.autonomy()?;
+        let mut settings = store.settings()?;
+        settings.enabled = enabled;
+        if let Some(max_active_tasks) = optional_u64(arguments, "max_active_tasks")? {
+            if !(1..=16).contains(&max_active_tasks) {
+                return Err(ToolError::InvalidInput("max_active_tasks"));
+            }
+            settings.max_active_tasks = max_active_tasks as u8;
+        }
+        let updated = store.set_settings(&settings)?;
+        Ok(serde_json::to_value(updated)?)
+    }
+
     fn result(
         &self,
         tool: &str,
@@ -1499,6 +1774,40 @@ fn optional_u64(
     }
 }
 
+fn optional_u8(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+    maximum: u64,
+) -> Result<Option<u8>, ToolError> {
+    match optional_u64(arguments, key)? {
+        Some(value) if value <= maximum => Ok(Some(value as u8)),
+        Some(_) => Err(ToolError::InvalidInput(key)),
+        None => Ok(None),
+    }
+}
+
+fn optional_bool(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<bool>, ToolError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(ToolError::InvalidInput(key)),
+    }
+}
+
+fn optional_object(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Value, ToolError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(json!({})),
+        Some(Value::Object(map)) => Ok(Value::Object(map.clone())),
+        Some(_) => Err(ToolError::InvalidInput(key)),
+    }
+}
+
 fn optional_string_array(
     arguments: &serde_json::Map<String, Value>,
     key: &'static str,
@@ -1548,6 +1857,39 @@ fn parse_consent_scope(value: &str) -> Option<ConsentScope> {
         "shared_project" => ConsentScope::SharedProject,
         _ => return None,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TaskTransition {
+    Start,
+    Pause,
+    Resume,
+    Cancel,
+}
+
+fn parse_goal_status(value: &str) -> Option<GoalStatus> {
+    Some(match value {
+        "proposed" => GoalStatus::Proposed,
+        "active" => GoalStatus::Active,
+        "paused" => GoalStatus::Paused,
+        "completed" => GoalStatus::Completed,
+        "abandoned" => GoalStatus::Abandoned,
+        _ => return None,
+    })
+}
+
+static AUTONOMY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn new_autonomy_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = AUTONOMY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{prefix}-{nanos:032x}-{sequence:016x}-{:x}",
+        std::process::id()
+    )
 }
 
 static CONSENT_GRANT_SEQUENCE: AtomicU64 = AtomicU64::new(0);

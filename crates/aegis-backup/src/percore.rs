@@ -67,6 +67,11 @@ pub(crate) const SIDECAR_DATABASES: &[SidecarDatabase] = &[
         kind: BackupFileKind::CoreConsentDatabase,
         ownership_table: "consent_ownership",
     },
+    SidecarDatabase {
+        file_name: "autonomy.db",
+        kind: BackupFileKind::CoreAutonomyDatabase,
+        ownership_table: "autonomy_ownership",
+    },
 ];
 
 /// Look up a sidecar database by its bare file name.

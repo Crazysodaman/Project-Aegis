@@ -24,6 +24,7 @@ const STANDARD_SIDECARS: &[(&str, &str)] = &[
     ("embeddings.db", "embedding_ownership"),
     ("possessions.db", "possessions_ownership"),
     ("consent.db", "consent_ownership"),
+    ("autonomy.db", "autonomy_ownership"),
 ];
 
 fn init_platform() -> (tempfile::TempDir, String) {
@@ -258,9 +259,9 @@ fn full_inventory_backup_and_restore_is_isolated() {
         .find(|core| core.core_uuid == CORE_B)
         .expect("Core B metadata");
 
-    // Core A has core.db plus eight sidecars; Core B lacks personal.db.
-    assert_eq!(core_a.databases.len(), 9);
-    assert_eq!(core_b.databases.len(), 8);
+    // Core A has core.db plus nine sidecars; Core B lacks personal.db.
+    assert_eq!(core_a.databases.len(), 10);
+    assert_eq!(core_b.databases.len(), 9);
     assert!(core_a
         .databases
         .iter()
@@ -398,7 +399,7 @@ fn missing_optional_databases_are_reported_not_fatal() {
             .iter()
             .any(|db| db.file_name == CORE_DATABASE_FILE));
         assert_eq!(core.databases.len(), 1);
-        assert_eq!(core.missing_optional_databases.len(), 8);
+        assert_eq!(core.missing_optional_databases.len(), 9);
     }
 
     let (_target_parent, target) = target_path();
@@ -481,6 +482,86 @@ fn consent_database_is_backed_up_and_restored_with_ownership_and_digest() {
         consent.sha256
     );
     assert!(!core_dir(&target, CORE_B).join("consent.db").exists());
+}
+
+#[test]
+fn autonomy_database_is_backed_up_and_restored_with_ownership_and_digest() {
+    let (source, token) = init_platform();
+    install(source.path(), &token, CORE_A, 1, "Core A");
+    install(source.path(), &token, CORE_B, 2, "Core B");
+
+    // Core A has an autonomy database; Core B does not.
+    write_sidecar(
+        source.path(),
+        CORE_A,
+        "autonomy.db",
+        "autonomy_ownership",
+        "A-autonomy.db",
+    );
+
+    let (_backup_parent, destination) = backup_path();
+    let report = backup(source.path(), &destination).expect("backup autonomy");
+
+    let core_a = report
+        .manifest
+        .cores
+        .iter()
+        .find(|core| core.core_uuid == CORE_A)
+        .expect("Core A metadata");
+    let core_b = report
+        .manifest
+        .cores
+        .iter()
+        .find(|core| core.core_uuid == CORE_B)
+        .expect("Core B metadata");
+
+    let autonomy = core_a
+        .databases
+        .iter()
+        .find(|db| db.file_name == "autonomy.db")
+        .expect("autonomy database entry");
+    assert_eq!(autonomy.kind, BackupFileKind::CoreAutonomyDatabase);
+    assert_eq!(autonomy.ownership_table, "autonomy_ownership");
+    assert_eq!(
+        autonomy.relative_path,
+        format!("cores/{CORE_A}/autonomy.db")
+    );
+    assert_eq!(autonomy.sha256.len(), 64);
+    assert!(autonomy.bytes > 0);
+    let autonomy_file = report
+        .manifest
+        .file(&autonomy.relative_path)
+        .expect("autonomy file entry");
+    assert_eq!(autonomy_file.kind, BackupFileKind::CoreAutonomyDatabase);
+    assert_eq!(autonomy_file.sha256, autonomy.sha256);
+    assert_eq!(autonomy_file.bytes, autonomy.bytes);
+
+    assert!(!core_b
+        .databases
+        .iter()
+        .any(|db| db.file_name == "autonomy.db"));
+    assert!(core_b
+        .missing_optional_databases
+        .contains(&"autonomy.db".to_owned()));
+    assert!(report
+        .missing_databases
+        .contains(&format!("cores/{CORE_B}/autonomy.db")));
+
+    let verification = verify_backup(&destination).expect("verify autonomy");
+    assert_eq!(verification.status, BackupVerificationStatus::Verified);
+    assert!(verification.issues.is_empty());
+
+    let (_target_parent, target) = target_path();
+    restore(&destination, &target, RestoreOptions::default()).expect("restore autonomy");
+
+    let restored = core_dir(&target, CORE_A).join("autonomy.db");
+    assert_eq!(ownership_core_uuid(&restored, "autonomy_ownership"), CORE_A);
+    assert_eq!(marker_value(&restored), "A-autonomy.db");
+    assert_eq!(
+        compute_file_sha256(&restored).expect("restored autonomy digest"),
+        autonomy.sha256
+    );
+    assert!(!core_dir(&target, CORE_B).join("autonomy.db").exists());
 }
 
 #[test]

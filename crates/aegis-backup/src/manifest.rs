@@ -43,6 +43,7 @@ pub enum BackupFileKind {
     CorePersonalDatabase,
     CorePossessionsDatabase,
     CoreConsentDatabase,
+    CoreAutonomyDatabase,
     CoreAssetFile,
 }
 
@@ -439,6 +440,7 @@ fn is_core_database_kind(kind: BackupFileKind) -> bool {
             | BackupFileKind::CorePersonalDatabase
             | BackupFileKind::CorePossessionsDatabase
             | BackupFileKind::CoreConsentDatabase
+            | BackupFileKind::CoreAutonomyDatabase
     )
 }
 

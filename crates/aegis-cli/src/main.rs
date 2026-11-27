@@ -1164,6 +1164,9 @@ fn command_living(args: &[String]) -> Result<(), String> {
     if group == "transfer" {
         return command_transfer(root, args);
     }
+    if matches!(group, "goal" | "task" | "autonomy") {
+        return command_autonomy(root, args);
+    }
 
     require_owner_proof(root)?;
     let core = require_arg(args, "--core")?;
@@ -1465,6 +1468,132 @@ fn command_transfer(root: &str, args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown transfer command: {other}")),
     };
     print_json(&json!({"schema": "aegis.cli.transfer.v1", "result": value}))
+}
+
+fn command_autonomy(root: &str, args: &[String]) -> Result<(), String> {
+    require_owner_proof(root)?;
+    let core = require_arg(args, "--core")?;
+    let group = args.get(1).map(String::as_str).unwrap_or("goal");
+    let action = args.get(2).map(String::as_str).unwrap_or("list");
+    let executor =
+        ToolExecutor::new(PathBuf::from(root), core).map_err(|error| error.to_string())?;
+    let limit = parse_usize(args, "--limit", 50)?;
+    let optional = |name: &str| {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .unwrap_or(Value::Null)
+    };
+    let required = |name: &str| -> Result<Value, String> {
+        optional_arg(args, name)
+            .map(|value| Value::from(value.to_owned()))
+            .ok_or_else(|| format!("missing required argument {name}"))
+    };
+    let number = |name: &str| -> Result<Value, String> {
+        optional_arg(args, name)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map(Value::from)
+                    .map_err(|_| format!("{name} must be a nonnegative integer"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(Value::Null))
+    };
+    let payload = || -> Result<Value, String> {
+        match optional_arg(args, "--payload") {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|error| format!("--payload must be JSON: {error}")),
+            None => Ok(json!({})),
+        }
+    };
+    let enabled = |value: &str| -> Result<Value, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(Value::Bool(true)),
+            "false" | "0" | "no" => Ok(Value::Bool(false)),
+            _ => Err("--enabled must be true or false".to_owned()),
+        }
+    };
+    let (tool, arguments) = match (group, action) {
+        ("goal", "create") => (
+            "goal.create",
+            json!({
+                "title": required("--title")?,
+                "description": optional("--description"),
+                "priority": number("--priority")?,
+                "due_at": optional("--due-at"),
+            }),
+        ),
+        ("goal", "list") => ("goal.list", json!({"limit": limit})),
+        ("goal", "update") => (
+            "goal.update",
+            json!({
+                "goal_id": required("--goal-id")?,
+                "status": optional("--status"),
+                "progress_percent": number("--progress")?,
+                "priority": number("--priority")?,
+            }),
+        ),
+        ("task", "create") => {
+            let payload = if let Some(document_id) = optional_arg(args, "--document-id") {
+                let per_run = optional_arg(args, "--percent-per-run")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "--percent-per-run must be an integer".to_owned())
+                    })
+                    .transpose()?
+                    .unwrap_or(25)
+                    .clamp(1, 100);
+                json!({"document_id": document_id, "percent_per_run": per_run})
+            } else {
+                payload()?
+            };
+            (
+                "task.create",
+                json!({
+                    "title": required("--title")?,
+                    "activity_kind": required("--activity-kind")?,
+                    "payload": payload,
+                    "due_at": optional("--due-at"),
+                    "priority": number("--priority")?,
+                    "plan_id": optional("--plan-id"),
+                    "goal_id": optional("--goal-id"),
+                }),
+            )
+        }
+        ("task", "list") => ("task.list", json!({"limit": limit})),
+        ("task", "start") => ("task.start", json!({"task_id": required("--task-id")?})),
+        ("task", "pause") => ("task.pause", json!({"task_id": required("--task-id")?})),
+        ("task", "resume") => ("task.resume", json!({"task_id": required("--task-id")?})),
+        ("task", "cancel") => ("task.cancel", json!({"task_id": required("--task-id")?})),
+        ("task", "complete") => (
+            "task.complete",
+            json!({
+                "task_id": required("--task-id")?,
+                "progress": number("--progress")?,
+            }),
+        ),
+        ("autonomy", "tick") => ("autonomy.tick", json!({})),
+        ("autonomy", "settings") => ("autonomy.settings", json!({})),
+        ("autonomy", "set-enabled") => (
+            "autonomy.set_enabled",
+            json!({
+                "enabled": enabled(require_arg(args, "--enabled")?)?,
+                "max_active_tasks": number("--max-active-tasks")?,
+            }),
+        ),
+        _ => return Err(format!("unknown autonomy command: {group} {action}")),
+    };
+    let result = executor
+        .execute(tool, &arguments, None)
+        .map_err(|error| error.to_string())?;
+    print_json(&json!({
+        "schema": "aegis.cli.autonomy.v1",
+        "tool": tool,
+        "status": result.status.as_str(),
+        "output": result.output,
+        "detail": result.detail,
+    }))
 }
 
 fn command_personal(args: &[String]) -> Result<(), String> {
@@ -2561,6 +2690,8 @@ fn usage() {
          aegis living catalog search <text> --root <path>\n\
          aegis living consent grant|grant-intimate|revoke|list|check --root <path> --core <id> [options]\n\
          aegis living transfer offer|list|get|accept|reject|cancel|events --root <path> [options]\n\
+         aegis living goal|task create|list|update|start|pause|resume|complete|cancel --root <path> --core <id> [options]\n\
+         aegis living autonomy tick|settings|set-enabled --root <path> --core <id> [options]\n\
          aegis voice synthesize --root <path> --core <core-id> --text <text> --out <wav> [--rate <percent>] [--volume <percent>]\n\
          aegis asset import <core-id> <kind> <file> --root <path> [--name <name>] [--media-type <type>] [--tags a,b]\n\
          aegis asset list <core-id> --root <path> [--kind <kind>] [--include-deleted]\n\

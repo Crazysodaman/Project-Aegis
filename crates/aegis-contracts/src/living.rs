@@ -593,6 +593,166 @@ impl TransferStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Active,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pending" => Self::Pending,
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Active,
+    Completed,
+    Abandoned,
+}
+
+impl PlanStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "active" => Self::Active,
+            "completed" => Self::Completed,
+            "abandoned" => Self::Abandoned,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    pub schema: String,
+    pub plan_id: String,
+    pub core_uuid: String,
+    pub goal_id: Option<String>,
+    pub title: String,
+    pub status: PlanStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+impl Plan {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.plan_id)
+            || !valid_id(&self.core_uuid)
+            || !bounded_opt(&self.goal_id, MAX_ID_CHARS)
+            || self.title.trim().is_empty()
+            || !bounded(&self.title, MAX_NAME_CHARS)
+            || !bounded(&self.created_at, 64)
+            || !bounded(&self.updated_at, 64)
+            || self.revision == 0
+        {
+            return Err("invalid plan");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Task {
+    pub schema: String,
+    pub task_id: String,
+    pub core_uuid: String,
+    pub plan_id: Option<String>,
+    pub goal_id: Option<String>,
+    pub title: String,
+    pub activity_kind: String,
+    pub status: TaskStatus,
+    pub priority: u8,
+    pub due_at: Option<String>,
+    pub progress_percent: u8,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+impl Task {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.task_id)
+            || !valid_id(&self.core_uuid)
+            || !bounded_opt(&self.plan_id, MAX_ID_CHARS)
+            || !bounded_opt(&self.goal_id, MAX_ID_CHARS)
+            || self.title.trim().is_empty()
+            || !bounded(&self.title, MAX_NAME_CHARS)
+            || self.activity_kind.trim().is_empty()
+            || !bounded(&self.activity_kind, MAX_TAG_CHARS)
+            || !bounded_opt(&self.due_at, 64)
+            || self.progress_percent > 100
+            || !bounded(&self.created_at, 64)
+            || !bounded(&self.updated_at, 64)
+            || self.revision == 0
+        {
+            return Err("invalid task");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutonomySettings {
+    pub schema: String,
+    pub core_uuid: String,
+    pub enabled: bool,
+    pub max_active_tasks: u8,
+    pub updated_at: String,
+    pub revision: u64,
+}
+
+impl AutonomySettings {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema != LIVING_CONTRACT_VERSION
+            || !valid_id(&self.core_uuid)
+            || !(1..=16).contains(&self.max_active_tasks)
+            || !bounded(&self.updated_at, 64)
+            || self.revision == 0
+        {
+            return Err("invalid autonomy settings");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +813,100 @@ mod tests {
         };
         assert!(grant.is_active("2026-01-02T00:00:00Z"));
         assert!(!grant.is_active("2025-12-31T00:00:00Z"));
+    }
+
+    fn plan() -> Plan {
+        Plan {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            plan_id: "plan-1".to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            goal_id: Some("goal-1".to_owned()),
+            title: "Read a book".to_owned(),
+            status: PlanStatus::Active,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 1,
+        }
+    }
+
+    fn task() -> Task {
+        Task {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            task_id: "task-1".to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            plan_id: Some("plan-1".to_owned()),
+            goal_id: Some("goal-1".to_owned()),
+            title: "Read chapter".to_owned(),
+            activity_kind: "read_document".to_owned(),
+            status: TaskStatus::Pending,
+            priority: 3,
+            due_at: Some("2026-01-02T00:00:00Z".to_owned()),
+            progress_percent: 0,
+            payload: serde_json::json!({ "document_id": "doc-1" }),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn autonomy_statuses_round_trip() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Active,
+            TaskStatus::Paused,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            assert_eq!(TaskStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(TaskStatus::parse("unknown"), None);
+        for status in [
+            PlanStatus::Active,
+            PlanStatus::Completed,
+            PlanStatus::Abandoned,
+        ] {
+            assert_eq!(PlanStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(PlanStatus::parse("unknown"), None);
+    }
+
+    #[test]
+    fn plans_and_tasks_validate() {
+        assert!(plan().validate().is_ok());
+        let mut bad_plan = plan();
+        bad_plan.revision = 0;
+        assert!(bad_plan.validate().is_err());
+
+        assert!(task().validate().is_ok());
+        let mut bad_task = task();
+        bad_task.progress_percent = 101;
+        assert!(bad_task.validate().is_err());
+        let mut bad_task = task();
+        bad_task.activity_kind.clear();
+        assert!(bad_task.validate().is_err());
+        let mut bad_task = task();
+        bad_task.task_id.clear();
+        assert!(bad_task.validate().is_err());
+    }
+
+    #[test]
+    fn autonomy_settings_validate() {
+        let settings = AutonomySettings {
+            schema: LIVING_CONTRACT_VERSION.to_owned(),
+            core_uuid: "a9a0a604-a4e7-4a88-a985-3f071e2c8e7d".to_owned(),
+            enabled: true,
+            max_active_tasks: 4,
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 1,
+        };
+        assert!(settings.validate().is_ok());
+        let mut bad = settings.clone();
+        bad.max_active_tasks = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = settings;
+        bad.max_active_tasks = 17;
+        assert!(bad.validate().is_err());
     }
 }

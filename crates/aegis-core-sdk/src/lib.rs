@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod autonomy;
+pub mod autonomy_engine;
 pub mod capability;
 pub mod consent;
 pub mod events;
@@ -16,6 +18,15 @@ pub mod personal;
 pub mod personality;
 pub mod possessions;
 
+pub use aegis_contracts::living::{AutonomySettings, Goal, Plan, PlanStatus, Task, TaskStatus};
+pub use autonomy::{
+    AutonomyEvent, AutonomyStore, AUTONOMY_APPLICATION_ID, AUTONOMY_COMPONENT, AUTONOMY_DB_FILE,
+    AUTONOMY_EVENTS_TABLE, AUTONOMY_EVENT_SCHEMA, AUTONOMY_GOALS_TABLE, AUTONOMY_OWNERSHIP_TABLE,
+    AUTONOMY_PLANS_TABLE, AUTONOMY_SCHEMA, AUTONOMY_SCHEMA_REVISION, AUTONOMY_SCHEMA_TABLE,
+    AUTONOMY_SETTINGS_TABLE, AUTONOMY_TASKS_TABLE, DEFAULT_MAX_ACTIVE_TASKS,
+    MAX_AUTONOMY_EVENT_DETAIL_BYTES, MAX_AUTONOMY_EVENT_LIST, MAX_AUTONOMY_LIST,
+};
+pub use autonomy_engine::{AutonomyEngine, TaskRun};
 pub use capability::{
     CapabilityManifest, CoreCapability, ALL_CAPABILITIES, CAPABILITY_MANIFEST_SCHEMA,
     REQUIRED_CAPABILITIES,
@@ -200,6 +211,7 @@ pub struct CoreSdkContext {
     pub personal: PersonalStore,
     pub possessions: PossessionsStore,
     pub consent: ConsentStore,
+    pub autonomy: AutonomyStore,
     pub personality: Option<PersonalityProfile>,
 }
 
@@ -220,6 +232,7 @@ impl CoreSdkContext {
         let personal = PersonalStore::open(root, &core_uuid)?;
         let possessions = PossessionsStore::open(root, &core_uuid)?;
         let consent = ConsentStore::open(root, &core_uuid)?;
+        let autonomy = AutonomyStore::open(root, &core_uuid)?;
         let capabilities = CapabilityManifest::full(&core_uuid)?;
         let personality = memory.load_personality()?;
         Ok(Self {
@@ -229,6 +242,7 @@ impl CoreSdkContext {
             personal,
             possessions,
             consent,
+            autonomy,
             personality,
         })
     }
@@ -261,6 +275,11 @@ impl CoreSdkContext {
     /// Borrow the consent store bound to the same Core identity.
     pub fn consent(&self) -> Result<&ConsentStore, SdkError> {
         Ok(&self.consent)
+    }
+
+    /// Borrow the autonomy store bound to the same Core identity.
+    pub fn autonomy(&self) -> &AutonomyStore {
+        &self.autonomy
     }
 
     /// Borrow the most recently loaded personality profile, if any.
